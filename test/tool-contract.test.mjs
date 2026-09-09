@@ -393,7 +393,11 @@ describe("Claude Desktop account switching", () => {
       const oldSessionId = destinations[0].sessionId;
       destinations[0].sessionId = "account-a-cli-restarted";
       writeDestination(destinations[0]);
-      const restarted = await send(oldSessionId, destinations[0].taskId);
+      const stale = await send(oldSessionId, destinations[0].taskId);
+      assert.equal(stale.structuredContent?.preflight?.code, "CLAUDE_SESSION_NOT_FOUND");
+      assert.equal(stale.structuredContent?.preflight?.sent, false);
+      assert.equal(received.length, 3);
+      const restarted = await send("auto", destinations[0].taskId);
       assert.equal(restarted.structuredContent?.receipt?.status, "reply_received", restarted.content?.[0]?.text);
       assert.equal(restarted.structuredContent.receipt.sessionId, destinations[0].sessionId);
       assert.equal(received.length, 4);

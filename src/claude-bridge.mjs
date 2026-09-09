@@ -18,7 +18,7 @@ import { ReplyForwarder } from "./reply-forwarder.mjs";
 import { assertRoutingReload, clientReloadReason, createReloadControl } from "./reload-control.mjs";
 import { readClaudeAccountContext } from "./desktop-account-context.mjs";
 import { assertAccountIdentity, bindUnsolicitedClaudeMessageAccount, publicAccountState, readBridgeAccounts, requireBridgeAccounts, sameAccountIdentity } from "./bridge-account-context.mjs";
-import { resolveClaudeDesktopSession } from "./claude-session-router.mjs";
+import { resolveClaudeDesktopSession, sameClaudeDesktopRecipient } from "./claude-session-router.mjs";
 import { createHardenedRootPolicy } from "./hardened-root-policy.mjs";
 
 exitForVersionRequest(import.meta.url);
@@ -313,7 +313,10 @@ registerTool(
           runtime.assertCurrent();
           if (desktopOnly) assertAccountIdentity(selectedAccounts);
           const current = findClaudeSession(session.sessionId ?? String(session.pid), { desktopOnly });
-          if (!current || current.pid !== session.pid || current.socket !== session.socket) {
+          const destinationUnchanged = desktopOnly
+            ? sameClaudeDesktopRecipient(session, current)
+            : Boolean(current && current.pid === session.pid && current.socket === session.socket);
+          if (!destinationUnchanged) {
             throw new Error("The Claude destination changed while this message was queued. No message was sent; inspect the existing Desktop session.");
           }
           if (desktopOnly || expectedCwd !== undefined) assertClaudeSessionCwd(current, expectedCwd);
