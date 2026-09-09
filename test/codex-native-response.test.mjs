@@ -148,6 +148,21 @@ describe("native Codex response observation", () => {
     assert.equal(inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: TURN_ID, expectedCwd: f.cwd }, { env: f.env }).status, "unavailable");
   });
 
+  it("rejects matching assistant IDs with contradictory event phase or type", (t) => {
+    for (const variant of [{ type: "AgentMessage", phase: "commentary" }, { type: "UserMessage", phase: "final_answer" }, { type: "AgentMessage" }]) {
+      const f = fixture(t);
+      const watermark = f.capture();
+      const records = f.turn();
+      records.splice(3, 0, { type: "event_msg", payload: {
+        type: "item_completed", thread_id: THREAD_ID, turn_id: TURN_ID,
+        item: { ...variant, id: records[3].payload.id, content: [{ type: "Text", text: "Received safely" }] },
+      } });
+      f.append(records);
+      assert.equal(f.read(watermark).status, "unavailable");
+      assert.equal(inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: TURN_ID, expectedCwd: f.cwd }, { env: f.env }).status, "unavailable");
+    }
+  });
+
   it("rejects a malformed exposed final assistant completion event", (t) => {
     const f = fixture(t);
     const records = f.turn();

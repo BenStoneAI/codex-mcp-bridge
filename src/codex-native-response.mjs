@@ -241,6 +241,10 @@ function inspectTurnRecords(records, threadId, turnId, cwd, { requireDispatch } 
   const eventItems = new Map();
   for (const { record, start } of turns) {
     if (record.type !== "event_msg" || record.payload.type !== "item_completed") continue;
+    const eventItem = record.payload.item;
+    if (ids.has(eventItem?.id) && (eventItem.type !== "AgentMessage" || eventItem.phase !== "final_answer")) {
+      throw new Error("The native assistant item representations conflict in type or phase");
+    }
     const text = completedEventText(record.payload.item);
     if (text === null) continue;
     const id = record.payload.item.id;
