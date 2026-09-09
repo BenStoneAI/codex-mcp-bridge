@@ -43,6 +43,30 @@ function fixture(t, { dispatch, now = Date.now, sleep, beforeRequest, accountCon
 }
 
 describe("Desktop creation receipts and deadlines", () => {
+  for (const outcome of ["unrelated", "conflicting", "matching"]) it(`validates nonempty native text against dispatch evidence: ${outcome}`, async (t) => {
+    let reads = 0;
+    const accounts = { claude: "a".repeat(64), codex: "b".repeat(64) };
+    const f = fixture(t, {
+      accountContext: () => accounts,
+      readResponse: () => {
+        reads += 1;
+        return outcome === "unrelated" ? { status: "unavailable", reason: "Different submitted request" }
+          : { status: "available", text: outcome === "matching" ? "API final" : "Different final" };
+      },
+      dispatch({ operation }) {
+        if (operation === "wait_threads") return { polls: [{ thread: { id: "task", hostId: "local", status: { type: "idle" } }, latestTurn: { id: "new-turn", status: "completed" }, latestAssistantMessage: { turnId: "new-turn", phase: "final_answer", text: "API final" } }] };
+        if (operation === "read_thread") return { thread: { id: "task", hostId: "local", cwd: f.cwd }, turns: [{ id: "new-turn" }] };
+      },
+    });
+    const result = await f.delivery.wait("task", { timeoutMs: 1000, previousTurnId: "old-turn", responseObservation: {
+      threadId: "task", previousTurnId: "old-turn", expectedCwd: f.cwd, executorThreadId: "executor-thread", prompt: "original request", accountContext: { ...accounts }, watermark: { status: "available" },
+    } });
+    assert.equal(reads, 1);
+    assert.equal(result.text, outcome === "matching" ? "API final" : "");
+    assert.equal(result.observationStatus, outcome === "matching" ? "available" : "unavailable");
+    assert.equal(f.calls.some(call => ["send_message_to_thread", "create_thread"].includes(call.operation)), false);
+  });
+
   it("marks a completed native turn with missing text as explicitly unavailable", async (t) => {
     const f = fixture(t, { dispatch({ operation }) {
       if (operation === "wait_threads") return { polls: [{ thread: { id: "task", hostId: "local", status: { type: "idle" } }, latestTurn: { id: "new-turn", status: "completed" }, latestAssistantMessage: null }] };

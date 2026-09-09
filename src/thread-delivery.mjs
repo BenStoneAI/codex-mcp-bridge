@@ -340,11 +340,15 @@ export class DesktopTaskDelivery {
         if (RELEASE_STATUSES.has(status)) {
           let observationStatus = text ? "available" : "unavailable";
           let observationReason;
-          if (!text) {
+          if (responseObservation || !text) {
             const observed = await this.observeNativeResponse(threadId, turnId, responseObservation, { deadline: startedAt + timeoutMs });
             observationStatus = observed.status;
             observationReason = observed.reason;
-            if (observed.status === "available") text = observed.text;
+            if (observed.status === "available" && text && text !== observed.text) {
+              observationStatus = "unavailable";
+              observationReason = "Native API text conflicts with the exact dispatch-bound final response; reply content was withheld.";
+            }
+            text = observationStatus === "available" ? observed.text : "";
           }
           return { threadId, turnId, status, text, observationStatus, ...(observationReason ? { observationReason } : {}), activity: [], errors: turn.error ? [turn.error] : [], durationMs: turn.durationMs ?? this.now() - startedAt };
         }
