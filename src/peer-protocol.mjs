@@ -88,6 +88,15 @@ export function peerKeyPath(pid, socket) {
   return path.join(sessionsDir(), `${pid}.${crypto.createHash("sha256").update(canonical).digest("hex")}.key`);
 }
 
+function recordedProcessStart(record) {
+  if (!IS_WINDOWS) return record.procStart ?? null;
+  // Current Claude publishes FILETIME as procStart; earlier bridge releases
+  // used procStartFt. Never choose one when the two disagree or are malformed.
+  const values = ["procStartFt", "procStart"].filter((key) => Object.hasOwn(record, key)).map((key) => record[key]);
+  if (!values.length || values.some((value) => typeof value !== "string" || !/^[1-9][0-9]{0,19}$/.test(value) || BigInt(value) > 18446744073709551615n)) return null;
+  return values.every((value) => value === values[0]) ? values[0] : null;
+}
+
 function readPeerToken(socket) {
   peerKeyPath(process.pid, socket);
   const candidates = listClaudeSessions({ includeBridges: true }).filter((entry) => {
@@ -101,7 +110,9 @@ function readPeerToken(socket) {
   try {
     const key = JSON.parse(fs.readFileSync(peerKeyPath(candidates[0].pid, socket), "utf8"));
     if (typeof key.peerToken !== "string" || !/^[0-9a-f]{32}$/i.test(key.peerToken)) throw new Error("Invalid peer key");
-    const identity = IS_WINDOWS ? key.procStartFt : key.procStart;
+    const identity = recordedProcessStart(key);
+    const hasIdentity = Object.hasOwn(key, "procStart") || (IS_WINDOWS && Object.hasOwn(key, "procStartFt"));
+    if (!identity && (hasIdentity || (IS_WINDOWS && hardenedBridgeEnabled()))) throw new Error("Peer process identity missing or invalid");
     if (identity && identity !== readProcessStart(candidates[0].pid)) throw new Error("Peer process identity changed");
     return key.peerToken;
   } catch {
@@ -184,7 +195,7 @@ export function listClaudeSessions({ includeDead = false, includeBridges = false
       kind: entry.kind ?? null,
       entrypoint: entry.entrypoint ?? null,
       startedAt: entry.startedAt ?? null,
-      processStart: (IS_WINDOWS ? entry.procStartFt : entry.procStart) ?? null,
+      processStart: recordedProcessStart(entry),
       socket: entry.messagingSocketPath,
       alive,
     });
@@ -461,7 +472,7 @@ export class PeerEndpoint {
       throw new Error("Peer endpoint startup was cancelled");
     }
 
-    const processIdentity = procStart ? (IS_WINDOWS ? { procStartFt: procStart } : { procStart }) : {};
+    const processIdentity = procStart ? (IS_WINDOWS ? { procStartFt: procStart, procStart } : { procStart }) : {};
     this.registry = {
       pid: this.pid,
       sessionId: crypto.randomUUID(),
