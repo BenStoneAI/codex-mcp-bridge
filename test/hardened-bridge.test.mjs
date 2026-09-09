@@ -252,6 +252,32 @@ test("hardened native return checks reject a read result outside the selected bi
   assert.equal(response.ok, false); assert.equal(response.error.code, "NATIVE_SCOPE_UNVERIFIED"); assert.deepEqual(h.state.actualCalls, ["read_thread"]);
 });
 
+test("hardened native wait rejects explicit return contradictions but accepts minimal native rows", async (t) => {
+  for (const contradiction of [{ cwd: "forbidden" }, { projectId: "wrong" }, { kind: "chatgpt" }]) {
+    const h = createNativeHarness(t);
+    const fields = { ...contradiction, ...(contradiction.cwd ? { cwd: h.state.threads.get("forbidden").cwd } : {}) };
+    h.state.resultOverride = () => ({ timedOut: false, wake: null, polls: [{ thread: { id: "target", hostId: "local", ...fields }, latestAssistantMessage: "must not escape" }] });
+    const response = await h.request("wait_threads", { targets: [{ threadId: "target", hostId: "local" }], timeoutMs: 0 });
+    assert.equal(response.ok, false); assert.equal(response.error.code, "NATIVE_SCOPE_UNVERIFIED");
+    assert.equal(JSON.stringify(response).includes("must not escape"), false);
+    assert.deepEqual(h.state.actualCalls, ["wait_threads"]);
+  }
+  const h = createNativeHarness(t);
+  h.state.resultOverride = () => ({ timedOut: false, wake: { reason: "turn_completed", threadId: "target", hostId: "local" }, polls: [{ thread: { id: "target", hostId: "local", status: { type: "idle" } }, latestAssistantMessage: { text: "valid minimal row" } }] });
+  const response = await h.request("wait_threads", { targets: [{ threadId: "target", hostId: "local" }], timeoutMs: 0 });
+  assert.equal(response.ok, true); assert.equal(response.result.polls[0].latestAssistantMessage.text, "valid minimal row");
+});
+
+test("hardened creation requires a confirmed exact local task id without marking uncertain outcomes unsent", async (t) => {
+  for (const result of [{ accepted: true }, { threadId: "" }, { threadId: " " }, { clientThreadId: "queued" }, { conversationId: "other" }, { threadId: "stale" }, { threadId: "target" }, { threadId: "other", hostId: "remote" }]) {
+    const h = createNativeHarness(t); h.state.resultOverride = () => result;
+    const response = await h.request("create_thread", { prompt: "fixture", target: { type: "project", projectId: "project-b", environment: { type: "local" } } });
+    assert.equal(response.ok, false, JSON.stringify(result));
+    assert.notEqual(response.error.sent, false, "a post-dispatch identity failure cannot prove the creation was unsent");
+    assert.deepEqual(h.state.actualCalls, ["create_thread"], "must neither retry nor substitute another creation");
+  }
+});
+
 test("hardened correlated replies retain roots and accounts through receipts and reload while unsolicited input is dropped", async (t) => {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-peer-scope-")); const project = path.join(sandbox, "project"); fs.mkdirSync(project);
   t.after(() => fs.rmSync(sandbox, { recursive: true, force: true }));

@@ -175,16 +175,28 @@ export function createNativeScopeAuthorizer({ dispatchDesktop, env = process.env
   const filterWait = (result, current) => {
     if (typeof result?.timedOut !== "boolean" || !Array.isArray(result?.polls)) fail("Native wait result is invalid");
     const allowed = new Map(current.targets.map((target) => [target.threadId, target]));
+    const checkReturnedBinding = (row, target) => {
+      // Native wait rows may omit these fields; explicit contradictions cannot
+      // override the independently reread target binding.
+      if ((row.kind !== undefined && row.kind !== target.kind)
+          || (row.projectId !== undefined && row.projectId !== target.projectId)) fail("Native wait result contradicts the selected task identity");
+      if (row.cwd !== undefined) {
+        const returned = roots.capture(row.cwd, "Native wait result working directory");
+        if (returned.path !== target.root.path || returned.identity !== target.root.identity) fail("Native wait result contradicts the selected task directory");
+      }
+    };
     const seen = new Set();
     const polls = result.polls.filter((poll) => {
       const id = poll?.thread?.id;
       if (typeof id !== "string" || poll?.thread?.hostId !== "local" || !allowed.has(id) || seen.has(id)) return false;
+      checkReturnedBinding(poll.thread, allowed.get(id));
       seen.add(id);
       return true;
     });
     const wake = result.wake && typeof result.wake === "object"
       && result.wake.hostId === "local" && allowed.has(result.wake.threadId)
       ? result.wake : null;
+    if (wake) checkReturnedBinding(wake, allowed.get(wake.threadId));
     return { timedOut: result.timedOut, wake, polls };
   };
   return async (request) => {
@@ -203,11 +215,13 @@ export function createNativeScopeAuthorizer({ dispatchDesktop, env = process.env
             || returned.root.identity !== selected.root.identity) fail("Native read result does not match the selected task binding");
       }
       if (request.operation === "create_thread") {
-        const createdId = result?.threadId ?? result?.conversationId;
-        if (typeof createdId === "string" && createdId) {
-          const created = await threadFor(request.executorThreadId, createdId, request.accountContext, current.projects);
-          if (created.projectId !== current.requestedProject.projectId || created.root.path !== current.requestedProject.root.path) fail("Created task does not belong to the requested saved project");
-        }
+        const createdId = result?.threadId;
+        if (typeof createdId !== "string" || !createdId.trim()) throw new NativeRelayError("Native creation did not return a confirmed task id; inspect the existing outcome before any further creation", "NATIVE_DELIVERY_UNCONFIRMED");
+        if (result.hostId !== undefined && result.hostId !== "local") fail("Native creation result does not identify the requested local host");
+        const created = await threadFor(request.executorThreadId, createdId, request.accountContext, current.projects);
+        roots.recheck(current.requestedProject.root, "Creation project directory");
+        if (created.projectId !== current.requestedProject.projectId || created.root.path !== current.requestedProject.root.path
+            || created.root.identity !== current.requestedProject.root.identity) fail("Created task does not belong to the requested saved project");
       }
       return { ...current, result };
     } catch (error) {
