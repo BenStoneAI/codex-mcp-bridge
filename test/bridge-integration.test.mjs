@@ -628,6 +628,34 @@ function runCheck(env) {
 }
 
 describe("check command exit status", () => {
+  it("checks Desktop connectivity without requiring a Claude caller or listing private tasks", async () => {
+    let relay;
+    const operations = [];
+    const socketRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bridge-check-native-"));
+    const socketPath = process.platform === "win32" ? `\\\\.\\pipe\\LOCAL\\bridge-check-${randomUUID()}` : path.join(socketRoot, "relay.sock");
+    try {
+      await withBridge(() => assert.fail("Desktop check contacted the legacy app-server"), async ({ env, desktopFixture, server }) => {
+        fs.rmSync(desktopFixture.registryFile);
+        const result = await runCheck(env);
+        assert.equal(result.code, 0, result.output);
+        assert.match(result.output, /native relay:.*available/);
+        assert.deepEqual(operations, ["list_projects"]);
+        assert.equal(server.connections, 0);
+      }, async home => {
+        relay = fixtureRelayServer({ home, socketPath, resolveExecutor: () => ({ threadId: "executor" }), dispatchDesktop: async ({ operation }) => {
+          operations.push(operation);
+          assert.equal(operation, "list_projects");
+          return { success: true, contentItems: [{ type: "inputText", text: JSON.stringify({ projects: [] }) }] };
+        } });
+        await relay.start();
+        return { CODEX_BRIDGE_DESKTOP_TASKS: "1", CODEX_NATIVE_RELAY_SOCKET: socketPath };
+      });
+    } finally {
+      relay?.stop();
+      fs.rmSync(socketRoot, { recursive: true, force: true });
+    }
+  });
+
   it("fails when the app-server cannot be reached", async () => {
     const result = await runCheck({
       PATH: process.env.PATH ?? "", SystemRoot: process.env.SystemRoot ?? "",

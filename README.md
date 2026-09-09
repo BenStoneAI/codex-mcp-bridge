@@ -150,6 +150,10 @@ Auto-reload watches the **installed source at the configured path**. It does not
 
 The installers preserve existing environment and access settings; explicit supported environment variables override their stored values. Claude's `--reset` explicitly returns to defaults. Codex entries with custom access, timeout, or transport settings are left intact with the exact command and arguments to update in place. `CLAUDE_DESKTOP_USER_DATA` pins only the data directory, never an account identity. Re-running an installer is unnecessary for later compatible source updates. The global install path remains stable across package versions.
 
+To migrate a legacy Claude registration to native Desktop task delivery, run `codex-mcp-bridge-install --desktop-tasks` (from a checkout: `node scripts/install-claude-desktop.mjs --desktop-tasks`). This explicit flag overrides a stored or inherited `CODEX_BRIDGE_DESKTOP_TASKS=0` and disables external app-server autostart while preserving access settings. Without the flag or an explicit routing setting, the installer leaves routing automatic so a later native relay installation can enable Desktop tasks. Existing explicit `0` settings remain unchanged until the flag or an environment override is supplied.
+
+Reconnect `codex-bridge` in the existing Claude task after changing its registration; source auto-reload cannot replace environment variables inherited by a running MCP process. If the task has a separate Claude Code MCP registration, update that registration too. Verify `codex_bridge_status` from the actual sending task reports Desktop tasks enabled, the native relay available, and a current runtime. Keep the destination open in Codex Desktop. An earlier unconfirmed send must be inspected before sending again.
+
 #### Show the final npm installation result
 
 Enable the optional shell integration once after installing the package:
@@ -512,7 +516,9 @@ Claude
 
 Resolution order is `CODEX_RELAY_ID` → that file → an error naming both. Never a guess: an invented executor fails inside Codex with a message that says nothing about the configuration that actually caused it. The recorded thread works as an executor even if it has never been opened in the app.
 
-**It is a backend, not a replacement.** `claude-bridge` picks between two delivery backends and reports which one it used; the tools, the peer protocol, the routing, the rate limits and `CodexAppServerClient` are untouched. The native path is used only when all of these hold — otherwise the app-server path runs exactly as it did before:
+**Desktop-only delivery.** With Desktop tasks enabled, both `send_to_codex_thread` and correlated Claude replies use the native relay. Desktop keeps its writer lock throughout delivery. If the relay is unavailable, the bridge reports that failure and does not start or use an external app-server.
+
+**Legacy reply delivery.** When Desktop tasks are explicitly disabled, `claude-bridge` can choose between native and external app-server delivery. The native path requires:
 
 | Condition | Otherwise |
 |---|---|
@@ -520,7 +526,7 @@ Resolution order is `CODEX_RELAY_ID` → that file → an error naming both. Nev
 | `CODEX_BRIDGE_NATIVE_RELAY` is not `0` | switched off by hand |
 | the Windows named pipe or macOS unix socket exists | the companion is not installed, or Codex Desktop is not running |
 
-A companion that cannot be reached before sending falls back to the app-server path. Once a request has been written, a refusal, timeout, or lost acknowledgement does not trigger another delivery: the first attempt may already have succeeded. Invalid or oversized messages are also refused rather than passed to another backend.
+Only legacy reply delivery falls back to the app-server path when a companion cannot be reached before sending. Once a request has been written, a refusal, timeout, or lost acknowledgement does not trigger another delivery: the first attempt may already have succeeded. Invalid or oversized messages are also refused rather than passed to another backend.
 
 The companion uses `CODEX_APP_TOOLS_PIPE_PATH` when inherited. Desktop builds that supply it only to their bundled `codex_app` MCP are also supported: the companion reads the exact `mcp_servers.codex_app.env` override from its launching app-server. It never picks a pipe from another session or saves a restart-specific address. The native connection remains separate from MCP stdio. If neither source provides a valid pipe, the relay stays unavailable; if a configured pipe is late during startup, it retries in the background. When several MCP instances start, status identifies a reachable shared companion instead of reporting that the relay is down.
 
@@ -539,11 +545,11 @@ The native pipe uses a 4-byte UInt32LE payload length followed by UTF-8 JSON-RPC
 
 ### Caveats
 
-- The Codex desktop app runs its own app-server over stdio (`ChatGPT.app/Contents/Resources/codex … app-server`, **no** `--listen`), so nothing external can attach to it. `~/.codex/ipc/ipc.sock` is the Electron app's internal IPC, not an app-server. Threads opened there can still be driven through the bridge, but by resuming from the rollout `.jsonl` rather than attaching live. The [native relay](#codex-desktop-native-relay) is not an exception to this: the companion never attaches to that app-server, it is *launched by* it as one of the app's own MCP servers.
-- **A thread currently open in the desktop app cannot be written to** through a second app-server — Codex holds a per-thread writer lock (`~/.codex/thread-writer-locks/`) and returns `thread <id> already has an active writer`. That error is the guard working, not data loss. Check `status` with `list_codex_threads` first and only send when it is `idle` or `notLoaded` and not open in the app. For the Claude → Codex relay specifically, the [native relay](#codex-desktop-native-relay) removes the second writer instead of waiting for the lock.
-- **Bridge-created threads are named before they are opened.** The bridge calls the app-server's `thread/name/set` with the requested title, or derives `[project] first line of prompt`, then opens the exact `codex://threads/<id>` link. This gives Codex Desktop a visible session title and preserves the precise `cwd` in the thread metadata.
+- Codex Desktop runs its own app-server. Its internal IPC endpoint is not an external app-server connection. The [native relay](#codex-desktop-native-relay), launched in Desktop's context, invokes Desktop's own tools to deliver into an existing task without resuming it through another server.
+- **The writer-lock limitation applies to the legacy external app-server path.** A second writer receives `thread <id> already has an active writer`; an `idle` task can still be owned by Desktop. Native Desktop delivery supports tasks open in the app. Check `codex_bridge_status` in the actual sending task and migrate a legacy registration with `--desktop-tasks`; do not delete lock files, stop Desktop, or ask for manual copying merely because Desktop owns the task.
+- **New Desktop tasks receive their saved project and title through Desktop's native creation tool.** Legacy bridge-created threads instead use the app-server's `thread/name/set` and an exact `codex://threads/<id>` link. Both paths preserve the requested workspace.
 - A repo living on the NTFS partition of a dual-boot machine (`/Volumes/<label>/...`) is **read-only** under macOS. Keep a separate checkout on an APFS volume to run and edit it.
-- `codex app-server daemon start` uses the `unix://` transport with a control socket at `~/.codex/app-server-control/app-server-control.sock`. The bridge does **not** use that path (different framing, no public API) — it always talks over `ws://`.
+- `codex app-server daemon start` uses the `unix://` transport with a control socket at `~/.codex/app-server-control/app-server-control.sock`. The legacy external bridge uses `ws://` instead; Desktop-only delivery uses the native relay.
 
 ## Troubleshooting
 

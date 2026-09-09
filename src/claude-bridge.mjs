@@ -15,7 +15,7 @@ import { readClaudeInboundPolicy } from "./claude-inbound-policy.mjs";
 import { assertRecipientClass, preflightFailure } from "./recipient-preflight.mjs";
 import { readCodexSenderContext } from "./codex-sender-context.mjs";
 import { ReplyForwarder } from "./reply-forwarder.mjs";
-import { clientReloadReason, createReloadControl } from "./reload-control.mjs";
+import { assertRoutingReload, clientReloadReason, createReloadControl } from "./reload-control.mjs";
 import { readClaudeAccountContext } from "./desktop-account-context.mjs";
 import { assertAccountIdentity, bindUnsolicitedClaudeMessageAccount, publicAccountState, readBridgeAccounts, requireBridgeAccounts, sameAccountIdentity } from "./bridge-account-context.mjs";
 import { resolveClaudeDesktopSession } from "./claude-session-router.mjs";
@@ -74,7 +74,8 @@ const reload = createReloadControl({
   quiesce: async () => { await peer.quiesce(); codex.close(); },
   exportState: () => ({ desktopOnly, peer: peer.exportReloadState(), forwarding: replyForwarder.exportReloadState(), threadId: forwarding.threadId }),
   restore: (state) => {
-    if (state.desktopOnly !== desktopOnly || state.threadId !== null && (typeof state.threadId !== "string" || !state.threadId.trim())) {
+    assertRoutingReload(state.desktopOnly, desktopOnly);
+    if (state.threadId !== null && (typeof state.threadId !== "string" || !state.threadId.trim())) {
       throw new Error("Invalid or incompatible Claude worker reload state");
     }
     peer.restoreReloadState(state.peer);

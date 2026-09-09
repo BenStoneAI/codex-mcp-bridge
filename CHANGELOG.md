@@ -6,6 +6,8 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [SemVer](ht
 
 ### Fixed
 
+- Migrate legacy Desktop installations explicitly with `install-claude-desktop.mjs --desktop-tasks`, disable external app-server autostart, and leave automatic routing unpinned so a later relay installation can take effect.
+- Reload effective shared routing changes on the existing MCP connection when safely idle. Allow legacy-to-Desktop upgrades while preserving confirmed receipts without replay; reject automatic downgrades to the external app-server. Clarify that open Desktop tasks are valid native destinations.
 - Reuse validated dependency hashes for unchanged files when preparing cached runtimes, avoiding repeated content reads that can delay MCP initialization during Windows startup. Changed source dependencies and modified cached copies still require verification; missing or invalid hash metadata falls back to reading file contents.
 - Log runtime preparation start and elapsed time before the MCP worker launches, so startup delays can be distinguished from worker initialization failures.
 

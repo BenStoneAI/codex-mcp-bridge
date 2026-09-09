@@ -16,16 +16,18 @@ const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".
 const workerSource = `
 import fs from 'node:fs';
 import readline from 'node:readline';
-import { createReloadControl } from './reload-control.mjs';
+import { assertRoutingReload, createReloadControl } from './reload-control.mjs';
+import { desktopTasksConfigured } from ${JSON.stringify(new URL("../src/native-relay.mjs", import.meta.url).href)};
 const VERSION = 'A';
 const ENTRY = process.env.TEST_ENTRY;
+const desktopMode = desktopTasksConfigured();
 let records = [];
 let pending = false;
 let reverseId = 0;
 const reverse = new Map();
 const reply = message => process.stdout.write(JSON.stringify(message) + '\\n');
 const control = createReloadControl({entry: ENTRY, inspect: () => pending ? 'Waiting for original reply' : null,
-  exportState: () => ({records}), restore: state => { if (VERSION === 'FAIL_RESTORE') throw new Error('Incompatible saved state'); records = state.records; }});
+  exportState: () => ({records, desktopMode}), restore: state => { if (VERSION === 'FAIL_RESTORE') throw new Error('Incompatible saved state'); assertRoutingReload(state.desktopMode, desktopMode); records = state.records; }});
 control.listen();
 readline.createInterface({input: process.stdin}).on('line', async line => {
   const msg = JSON.parse(line);
@@ -50,7 +52,7 @@ readline.createInterface({input: process.stdin}).on('line', async line => {
       if (name === 'reverse') roots = await new Promise(resolve => {
         const id = ++reverseId; reverse.set(id, resolve); reply({jsonrpc:'2.0',id,method:'roots/list'});
       });
-      return {content:[{type:'text',text:VERSION}],structuredContent:{version:VERSION,records,pending,roots,meta:msg.params._meta}};
+      return {content:[{type:'text',text:VERSION}],structuredContent:{version:VERSION,desktopMode,records,pending,roots,meta:msg.params._meta}};
     });
     reply({jsonrpc:'2.0',id:msg.id,result});
   } catch(error) { reply({jsonrpc:'2.0',id:msg.id,error:{code:-32603,message:error.message}}); }
@@ -74,11 +76,14 @@ function installation(t, entry = "index.mjs") {
 async function connect(t, fixture, extraEnv = {}) {
   const client = new Client({ name: "reload-test", version: "1" }, { capabilities: { roots: { listChanged: true } } });
   client.setRequestHandler(ListRootsRequestSchema, () => ({ roots: [{ uri: "file:///test-project" }] }));
-  const transport = new StdioClientTransport({ command: process.execPath, args: [fixture.launcher], env: {
+  const env = {
     ...process.env, CODEX_BRIDGE_RUNTIME_CACHE: path.join(fixture.root, "cache"), CODEX_BRIDGE_RELOAD_POLL_MS: "100",
     CODEX_BRIDGE_RELOAD_SETTLE_MS: "100", TEST_ENTRY: fixture.entry, TEST_LEDGER: fixture.ledger,
-    ...extraEnv,
-  }, stderr: "pipe" });
+    CODEX_HOME: path.join(fixture.root, ".codex"),
+  };
+  delete env.CODEX_BRIDGE_DESKTOP_TASKS;
+  Object.assign(env, extraEnv);
+  const transport = new StdioClientTransport({ command: process.execPath, args: [fixture.launcher], env, stderr: "pipe" });
   let stderr = "";
   transport.stderr.on("data", data => { stderr += data; if(process.env.TEST_RELOAD_DEBUG) process.stderr.write(data); });
   t.after(async () => { await client.close(); fixture.cleanup(); });
@@ -128,6 +133,57 @@ it("retains pending deliveries and waits until their original result is confirme
   const after = await eventually(api.call, value => value.structuredContent.version === "B", api.stderr);
   assert.deepEqual(after.structuredContent.records, ["pending-message"]);
   assert.equal(fs.readFileSync(fixture.ledger, "utf8"), "pending-message\n");
+});
+
+for (const entry of ["index.mjs", "claude-bridge.mjs"]) {
+  it(`reloads ${entry} for an automatic routing change only after pending work completes`, async t => {
+    const fixture = installation(t, entry);
+    const api = await connect(t, fixture);
+    const before = await api.call();
+    assert.equal(before.structuredContent.desktopMode, false);
+    await api.call("add", { value: "original-message" });
+    await api.call("hold");
+    const configuration = path.join(fixture.root, ".codex", "native-relay.json");
+    fs.mkdirSync(path.dirname(configuration), { recursive: true });
+    fs.writeFileSync(configuration, JSON.stringify({ desktopTasks: true }));
+    const deferred = await eventually(api.call, value => value.structuredContent.autoReload.reason?.includes("original reply"), api.stderr);
+    assert.equal(deferred.structuredContent.desktopMode, false);
+    assert.equal(deferred.structuredContent.autoReload.workerPid, before.structuredContent.autoReload.workerPid);
+    assert.equal(deferred.structuredContent.autoReload.pending, true);
+    assert.equal(deferred.structuredContent.autoReload.availableRoutingConfiguration, true);
+    await api.call("release");
+    const after = await eventually(api.call, value => value.structuredContent.desktopMode === true, api.stderr);
+    assert.equal(after.structuredContent.autoReload.supervisorPid, before.structuredContent.autoReload.supervisorPid);
+    assert.notEqual(after.structuredContent.autoReload.workerPid, before.structuredContent.autoReload.workerPid);
+    assert.equal(after.structuredContent.autoReload.revision, before.structuredContent.autoReload.revision);
+    assert.equal(after.structuredContent.autoReload.availableRevision, before.structuredContent.autoReload.revision);
+    assert.equal(after.structuredContent.autoReload.routingConfiguration, true);
+    assert.equal(after.structuredContent.autoReload.pending, false);
+    assert.equal(after.structuredContent.autoReload.reloads, 1);
+    assert.deepEqual(after.structuredContent.records, ["original-message"]);
+    assert.equal(fs.readFileSync(fixture.ledger, "utf8"), "original-message\n");
+    fs.writeFileSync(configuration, JSON.stringify({ desktopTasks: false }));
+    const downgrade = await eventually(api.call, value => value.structuredContent.autoReload.reason?.includes("downgrade"), api.stderr);
+    assert.equal(downgrade.structuredContent.desktopMode, true);
+    assert.equal(downgrade.structuredContent.autoReload.workerPid, after.structuredContent.autoReload.workerPid);
+    assert.deepEqual(downgrade.structuredContent.records, ["original-message"]);
+  });
+}
+
+it("keeps an explicit legacy routing override when the automatic relay configuration changes", async t => {
+  const fixture = installation(t);
+  const api = await connect(t, fixture, { CODEX_BRIDGE_DESKTOP_TASKS: "0" });
+  const before = await api.call();
+  const configuration = path.join(fixture.root, ".codex", "native-relay.json");
+  fs.mkdirSync(path.dirname(configuration), { recursive: true });
+  fs.writeFileSync(configuration, JSON.stringify({ desktopTasks: true }));
+  await new Promise(resolve => setTimeout(resolve, 700));
+  const after = await api.call();
+  assert.equal(after.structuredContent.desktopMode, false);
+  assert.equal(after.structuredContent.autoReload.workerPid, before.structuredContent.autoReload.workerPid);
+  assert.equal(after.structuredContent.autoReload.pending, false);
+  assert.equal(after.structuredContent.autoReload.availableRoutingConfiguration, false);
+  assert.equal(after.structuredContent.autoReload.reloads, 0);
 });
 
 it("does not interrupt active calls and does not replay writes after a worker crash", async t => {

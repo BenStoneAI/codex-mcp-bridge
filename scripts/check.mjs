@@ -2,9 +2,12 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { desktopTasksConfigured } from "../src/native-relay.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const bridgeEnvNames = [
+  "CODEX_HOME",
+  "CLAUDE_DESKTOP_USER_DATA",
   "CODEX_APP_SERVER_URL",
   "CODEX_BIN",
   "CODEX_BRIDGE_ALLOWED_ROOTS",
@@ -40,7 +43,9 @@ try {
   await client.connect(transport);
   const tools = await client.listTools();
   console.log("tools:", tools.tools.map((t) => t.name).join(", "));
-  const listed = await client.callTool({ name: "list_codex_threads", arguments: { limit: 3 } });
+  const listed = await client.callTool(desktopTasksConfigured()
+    ? { name: "codex_bridge_status", arguments: {} }
+    : { name: "list_codex_threads", arguments: { limit: 3 } });
   console.log(listed.content[0].text.slice(0, 600));
   if (listed.isError) process.exitCode = 1;
 } catch (err) {

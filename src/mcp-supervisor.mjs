@@ -4,6 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createReleaseSnapshot, sourceRevision } from "./release-snapshot.mjs";
+import { desktopTasksConfigured } from "./native-relay.mjs";
 
 const ENTRIES = new Set(["index.mjs", "claude-bridge.mjs", "native-relay-companion.mjs"]);
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
@@ -129,6 +130,7 @@ export async function runSupervisor(entry, options = {}) {
   const log = (message) => process.stderr.write(`[bridge-supervisor] ${message}\n`);
   const output = (message) => process.stdout.write(`${JSON.stringify(message)}\n`);
   const env = { ...process.env, CODEX_BRIDGE_SOURCE_ROOT: root };
+  const routingConfiguration = () => entry === "native-relay-companion.mjs" ? null : desktopTasksConfigured(env);
   if (entry === "native-relay-companion.mjs" && !env.CODEX_APP_TOOLS_PIPE_PATH) {
     const { resolveNativeToolsPipePath } = await import("./native-relay.mjs");
     const pipe = await resolveNativeToolsPipePath();
@@ -145,6 +147,7 @@ export async function runSupervisor(entry, options = {}) {
   let failure = null;
   let sequence = 0;
   let observed = null;
+  let observedRouting = null;
   let observedAt = 0;
   let retryAt = 0;
   let reason = null;
@@ -154,7 +157,9 @@ export async function runSupervisor(entry, options = {}) {
   const reverse = new Map();
   const workers = new Set();
   const diagnostics = () => ({ enabled: true, supervisorPid: process.pid, workerPid: active?.process.pid ?? null,
-    revision: active?.release.revision ?? null, availableRevision: observed, pending: Boolean(observed && observed !== active?.release.revision),
+    revision: active?.release.revision ?? null, availableRevision: observed,
+    routingConfiguration: active?.routingConfiguration ?? null, availableRoutingConfiguration: observedRouting,
+    pending: Boolean(observed && (observed !== active?.release.revision || observedRouting !== active?.routingConfiguration)),
     state: failure ? "failed" : switching ? "reloading" : reason ? "deferred" : "current", reason: failure ?? reason, reloads });
 
   const handlers = {
@@ -197,19 +202,21 @@ export async function runSupervisor(entry, options = {}) {
       if (worker === active && !worker.retiring && !stopping) { failure = `${error.message}; automatic replay is disabled because delivery state may be unknown`; log(failure); }
     },
   };
-  const spawn = (release) => {
+  const spawn = (release, routing) => {
     if (stopping) throw new Error("The MCP client disconnected before activation");
     const worker = new Worker(release, entry, env, handlers);
+    worker.routingConfiguration = routing;
     workers.add(worker);
     return worker;
   };
   const check = async () => {
     if (switching || !ready || stopping || failure) return;
     let revision;
-    try { revision = sourceRevision(root); }
+    let routing;
+    try { revision = sourceRevision(root); routing = routingConfiguration(); }
     catch (error) { reason = `Installation is not ready: ${error.message}`; return; }
-    if (observed !== revision) { observed = revision; observedAt = Date.now(); retryAt = 0; }
-    if (revision === active.release.revision) { reason = null; return; }
+    if (observed !== revision || observedRouting !== routing) { observed = revision; observedRouting = routing; observedAt = Date.now(); retryAt = 0; }
+    if (revision === active.release.revision && routing === active.routingConfiguration) { reason = null; return; }
     if (Date.now() - observedAt < settleMs || Date.now() < retryAt) { reason ??= "Waiting for a complete, stable installation"; return; }
     if (active.clientPending.size || reverse.size) { reason = "A request is still running; its worker is retained"; return; }
     switching = true;
@@ -220,7 +227,7 @@ export async function runSupervisor(entry, options = {}) {
       const state = await previous.control("inspect");
       if (!state.reloadable) { reason = state.reason ?? "Pending deliveries prevent a safe reload"; return; }
       const release = createReleaseSnapshot(root, { expectedRevision: revision });
-      candidate = spawn(release);
+      candidate = spawn(release, routing);
       const initialized = await candidate.rpc("initialize", initializeParams);
       if (initialized.protocolVersion !== initializeResult.protocolVersion || JSON.stringify(initialized.capabilities) !== JSON.stringify(initializeResult.capabilities)) {
         throw new Error("The new MCP protocol or capabilities require an explicit client reconnect");
@@ -230,6 +237,7 @@ export async function runSupervisor(entry, options = {}) {
       if (!Array.isArray(catalog.tools) || !catalog.tools.length || catalog.nextCursor) throw new Error("The candidate tool catalog is incomplete");
       const oldCatalog = await previous.rpc("tools/list", {});
       if (sourceRevision(root) !== revision) throw new Error("The installation changed before activation");
+      if (routingConfiguration() !== routing) throw new Error("The routing configuration changed before activation");
       quiesced = true;
       const exported = await previous.control("quiesce");
       await candidate.control("restore", exported.state);
@@ -301,7 +309,8 @@ export async function runSupervisor(entry, options = {}) {
   const initial = createReleaseSnapshot(root);
   log(`prepared ${entry} runtime in ${Math.round(performance.now() - preparationStarted)} ms`);
   observed = initial.revision;
-  active = spawn(initial);
+  observedRouting = routingConfiguration();
+  active = spawn(initial, observedRouting);
   const timer = setInterval(() => { void check(); }, pollMs);
   lines(process.stdin, (message) => {
     if (!message || message.jsonrpc !== "2.0" || (!message.method && !hasId(message))) throw new Error("Invalid client JSON-RPC message");

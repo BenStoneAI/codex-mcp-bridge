@@ -27,7 +27,7 @@ import { DesktopTaskDelivery, DESKTOP_TOOL_BUDGET_MS } from "./thread-delivery.m
 import { desktopTasksConfigured } from "./native-relay.mjs";
 import { exitForVersionRequest } from "./cli-version.mjs";
 import { createRuntimeState } from "./runtime-state.mjs";
-import { clientReloadReason, createReloadControl } from "./reload-control.mjs";
+import { assertRoutingReload, clientReloadReason, createReloadControl } from "./reload-control.mjs";
 import { accountIdentity, assertAccountIdentity, publicAccountState, readBridgeAccounts, requireBridgeAccounts } from "./bridge-account-context.mjs";
 import { assertClaudeSenderContext, readClaudeSenderContext, requireClaudeSenderContext } from "./claude-sender-context.mjs";
 
@@ -101,7 +101,8 @@ const reload = createReloadControl({
   quiesce: () => { client?.close(); },
   exportState: () => ({ desktopTasksEnabled, ownedThreadIds: [...security.ownedThreadIds] }),
   restore: (state) => {
-    if (state.desktopTasksEnabled !== desktopTasksEnabled || !Array.isArray(state.ownedThreadIds)
+    assertRoutingReload(state.desktopTasksEnabled, desktopTasksEnabled);
+    if (!Array.isArray(state.ownedThreadIds)
       || state.ownedThreadIds.some((id) => typeof id !== "string" || !id.trim())
       || new Set(state.ownedThreadIds).size !== state.ownedThreadIds.length) throw new Error("Invalid or incompatible Codex worker reload state");
     security.ownedThreadIds = new Set(state.ownedThreadIds);
@@ -480,7 +481,10 @@ registerTool(
     title: "Send a prompt to a Codex thread",
     description:
       "Send a prompt as a new user turn inside an existing Codex thread and wait for Codex to answer. " +
-      "The thread keeps its full history, cwd and model. Use list_codex_threads first if you do not know the threadId.",
+      "The thread keeps its full history, cwd and model. Use list_codex_threads first if you do not know the threadId. " +
+      "Desktop-owned tasks must use Desktop native delivery; an open task is a valid destination. " +
+      "If legacy delivery reports an active writer, inspect codex_bridge_status and repair the native relay/configuration. " +
+      "Do not close the task, create a replacement, or ask the user to copy the message manually.",
     inputSchema: {
       threadId: z.string().describe("Codex thread id (UUID) - get it from list_codex_threads"),
       prompt: z.string().describe("The message to send to Codex, exactly as a user would type it"),

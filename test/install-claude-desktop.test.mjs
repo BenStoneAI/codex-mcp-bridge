@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { desktopTasksConfigured } from "../src/native-relay.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const installer = path.join(root, "scripts", "install-claude-desktop.mjs");
@@ -55,6 +56,46 @@ function configWith(entry) {
 }
 
 describe("claude desktop installer", () => {
+  it("migrates a stored legacy mode with --desktop-tasks while preserving access settings", () => {
+    const config = configWith({ mcpServers: { "codex-bridge": { env: {
+      CODEX_BRIDGE_DESKTOP_TASKS: "0", CODEX_BRIDGE_AUTOSTART: "1",
+      CODEX_BRIDGE_APPROVAL: "deny", CODEX_BRIDGE_SANDBOX: "read-only", CODEX_BRIDGE_ALLOWED_THREADS: "preserved",
+    } } } });
+    const env = install({ config, args: ["--desktop-tasks"], env: { CODEX_BRIDGE_DESKTOP_TASKS: "0", CODEX_BRIDGE_AUTOSTART: "1" } }).mcpServers["codex-bridge"].env;
+    assert.equal(env.CODEX_BRIDGE_DESKTOP_TASKS, "1");
+    assert.equal(env.CODEX_BRIDGE_AUTOSTART, "0");
+    assert.equal(env.CODEX_BRIDGE_APPROVAL, "deny");
+    assert.equal(env.CODEX_BRIDGE_SANDBOX, "read-only");
+    assert.equal(env.CODEX_BRIDGE_ALLOWED_THREADS, "preserved");
+  });
+
+  it("leaves automatic routing unpinned so a later relay installation enables Desktop tasks", () => {
+    const relayHome = fs.mkdtempSync(path.join(sandbox, "automatic-routing-"));
+    const config = configWith(null);
+    const env = install({ config, env: { CODEX_HOME: relayHome } }).mcpServers["codex-bridge"].env;
+    assert.equal(Object.hasOwn(env, "CODEX_BRIDGE_DESKTOP_TASKS"), false);
+    assert.equal(desktopTasksConfigured({ ...env, CODEX_HOME: relayHome }), false);
+    fs.writeFileSync(path.join(relayHome, "native-relay.json"), JSON.stringify({ desktopTasks: true }));
+    assert.equal(desktopTasksConfigured({ ...env, CODEX_HOME: relayHome }), true);
+    const refreshed = install({ config, env: { CODEX_HOME: relayHome } }).mcpServers["codex-bridge"].env;
+    assert.equal(Object.hasOwn(refreshed, "CODEX_BRIDGE_DESKTOP_TASKS"), false);
+    assert.equal(refreshed.CODEX_BRIDGE_AUTOSTART, "0");
+  });
+
+  it("preserves a deliberate Desktop opt-out until an explicit environment override", () => {
+    const relayHome = fs.mkdtempSync(path.join(sandbox, "explicit-routing-"));
+    fs.writeFileSync(path.join(relayHome, "native-relay.json"), JSON.stringify({ desktopTasks: true }));
+    const config = configWith({ mcpServers: { "codex-bridge": { env: {
+      CODEX_BRIDGE_DESKTOP_TASKS: "0", CODEX_BRIDGE_AUTOSTART: "1",
+    } } } });
+    const kept = install({ config, env: { CODEX_HOME: relayHome } }).mcpServers["codex-bridge"].env;
+    assert.equal(kept.CODEX_BRIDGE_DESKTOP_TASKS, "0");
+    assert.equal(kept.CODEX_BRIDGE_AUTOSTART, "1");
+    const changed = install({ config, env: { CODEX_HOME: relayHome, CODEX_BRIDGE_DESKTOP_TASKS: "1" } }).mcpServers["codex-bridge"].env;
+    assert.equal(changed.CODEX_BRIDGE_DESKTOP_TASKS, "1");
+    assert.equal(changed.CODEX_BRIDGE_AUTOSTART, "0");
+  });
+
   it("disables legacy autostart in Desktop mode while preserving permission settings", () => {
     const config = configWith({ mcpServers: { "codex-bridge": { env: {
       CODEX_BRIDGE_AUTOSTART: "1", CODEX_BRIDGE_APPROVAL: "deny", CODEX_BRIDGE_SANDBOX: "read-only", CODEX_BRIDGE_ALLOWED_THREADS: "preserved",

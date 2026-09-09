@@ -1,3 +1,9 @@
+export function assertRoutingReload(previous, next) {
+  if (typeof previous !== "boolean" || typeof next !== "boolean" || previous && !next) {
+    throw new Error("Invalid routing reload or Desktop-to-app-server downgrade; reconnect explicitly to change to legacy mode");
+  }
+}
+
 export function cloneReloadState(value) {
   const encoded = JSON.stringify(value);
   if (typeof encoded !== "string" || Buffer.byteLength(encoded) > 16 * 1024 * 1024) {

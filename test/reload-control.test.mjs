@@ -1,8 +1,33 @@
 import assert from "node:assert/strict";
 import { it } from "node:test";
-import { createReloadControl } from "../src/reload-control.mjs";
+import { assertRoutingReload, createReloadControl } from "../src/reload-control.mjs";
 import { PeerEndpoint } from "../src/peer-protocol.mjs";
 import { ReplyForwarder } from "../src/reply-forwarder.mjs";
+
+it("upgrades a quiescent legacy worker to Desktop delivery without replaying confirmed replies", async () => {
+  let sends = 0;
+  const previousForwarder = new ReplyForwarder({ deliver: async () => { sends++; }, minIntervalMs: 0 });
+  previousForwarder.enqueue({ inReplyTo: "confirmed", text: "reply" }, "original-task");
+  while (previousForwarder.reloadReason()) await new Promise(resolve => setTimeout(resolve, 5));
+  const nextForwarder = new ReplyForwarder({ deliver: async () => { sends++; }, minIntervalMs: 0 });
+  const previous = createReloadControl({ entry: "claude-bridge.mjs",
+    inspect: () => previousForwarder.reloadReason(),
+    exportState: () => ({ desktopOnly: false, forwarding: previousForwarder.exportReloadState() }) });
+  const next = createReloadControl({ entry: "claude-bridge.mjs", env: { CODEX_BRIDGE_WORKER: "1", CODEX_BRIDGE_STAGED: "1" }, channel: { send() {} },
+    restore: state => { assertRoutingReload(state.desktopOnly, true); nextForwarder.restoreReloadState(state.forwarding); } });
+  const { state } = await previous.control("quiesce");
+  await next.control("restore", state);
+  await next.control("activate");
+  assert.equal(nextForwarder.enqueue({ inReplyTo: "confirmed", text: "duplicate" }, "original-task").status, "forwarded");
+  assert.equal(sends, 1);
+  for (const [from, to] of [[true, false], [undefined, true], ["false", true], [false, undefined]]) {
+    assert.throws(() => assertRoutingReload(from, to), /routing reload/);
+  }
+  assert.doesNotThrow(() => assertRoutingReload(false, false));
+  assert.doesNotThrow(() => assertRoutingReload(true, true));
+  previousForwarder.close();
+  nextForwarder.close();
+});
 
 it("blocks staging and concurrent work, transfers state, and resumes a failed switch",async()=>{
   let busy=false;

@@ -13,6 +13,7 @@ exitForVersionRequest(import.meta.url);
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cfgPath = process.env.CLAUDE_DESKTOP_CONFIG ?? claudeDesktopConfigPath();
 const reset = process.argv.includes("--reset");
+const forceDesktopTasks = process.argv.includes("--desktop-tasks");
 
 /**
  * This bridge is intentionally the local hand-off point between Claude and
@@ -55,10 +56,13 @@ cfg.mcpServers = cfg.mcpServers ?? {};
 const previousEntry = (reset ? {} : cfg.mcpServers["codex-bridge"]) ?? {};
 const previousEnv = previousEntry.env ?? {};
 const settled = (name, fallback) => process.env[name] ?? previousEnv[name] ?? fallback;
-const desktopMode = settled("CODEX_BRIDGE_DESKTOP_TASKS", desktopTasksConfigured() ? "1" : "0");
+const desktopMode = forceDesktopTasks ? "1" : settled("CODEX_BRIDGE_DESKTOP_TASKS");
+const desktopEnabled = desktopMode === undefined ? desktopTasksConfigured() : desktopMode === "1";
 
 const kept = Object.keys(previousEnv).filter(
-  (name) => process.env[name] === undefined && name !== "CODEX_BIN",
+  (name) => process.env[name] === undefined && name !== "CODEX_BIN" &&
+    !(forceDesktopTasks && name === "CODEX_BRIDGE_DESKTOP_TASKS") &&
+    !(desktopEnabled && name === "CODEX_BRIDGE_AUTOSTART"),
 );
 
 cfg.mcpServers["codex-bridge"] = {
@@ -93,8 +97,8 @@ cfg.mcpServers["codex-bridge"] = {
     CODEX_BRIDGE_SANDBOX: settled("CODEX_BRIDGE_SANDBOX", "workspace-write"),
     CODEX_BRIDGE_OPEN_IN_APP: settled("CODEX_BRIDGE_OPEN_IN_APP", IS_WINDOWS ? "1" : "0"),
     CODEX_BRIDGE_RELEASE_AFTER_TURN: settled("CODEX_BRIDGE_RELEASE_AFTER_TURN", IS_WINDOWS ? "1" : "0"),
-    CODEX_BRIDGE_DESKTOP_TASKS: desktopMode,
-    CODEX_BRIDGE_AUTOSTART: desktopMode === "1" ? "0" : settled("CODEX_BRIDGE_AUTOSTART", "1"),
+    ...(desktopMode !== undefined ? { CODEX_BRIDGE_DESKTOP_TASKS: desktopMode } : {}),
+    CODEX_BRIDGE_AUTOSTART: desktopEnabled ? "0" : settled("CODEX_BRIDGE_AUTOSTART", "1"),
     ...(process.env.CODEX_BRIDGE_ALLOWED_THREADS !== undefined
       ? { CODEX_BRIDGE_ALLOWED_THREADS: process.env.CODEX_BRIDGE_ALLOWED_THREADS }
       : {}),
@@ -120,6 +124,7 @@ fs.writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`, "utf8");
 console.log(`platform: ${PLATFORM_LABEL}`);
 console.log(`updated ${cfgPath}`);
 console.log(JSON.stringify(cfg.mcpServers["codex-bridge"], null, 2));
+console.log(`Desktop tasks: ${desktopEnabled ? "enabled" : "disabled"} (${desktopMode === undefined ? "automatic relay configuration" : forceDesktopTasks ? "--desktop-tasks" : "explicit environment setting"}).`);
 
 if (reset) {
   console.log("\n--reset: existing values were discarded in favour of the defaults.");
@@ -149,3 +154,4 @@ if (cfg.mcpServers["codex-bridge"].env.CODEX_BRIDGE_THREAD_POLICY === "owned") {
 
 console.log("\nReconnect codex-bridge once in the existing Claude task to load the supervisor. Subsequent compatible installed-source updates reload automatically when the worker is safely idle.");
 console.log("Verify codex_bridge_status from that task: autoReload must be enabled and runtime state must be current. A separate diagnostic process does not verify the app's loaded MCP process.");
+if (desktopEnabled) console.log("Verify Desktop tasks are enabled and the native relay is available. Configuration changes require MCP reconnect even when source auto-reload is enabled; keep the destination task open in Codex Desktop.");
