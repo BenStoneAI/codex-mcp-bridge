@@ -309,10 +309,13 @@ function formatTurn(result, { desktop = false } = {}) {
   if (result.errors.length) {
     lines.push(`errors: ${result.errors.map((e) => e.message ?? JSON.stringify(e)).join(" | ")}`);
   }
+  if (result.responseStatus) lines.push(`response: ${result.responseStatus}`);
+  if (result.assistantItems?.length) lines.push(`assistant item IDs: ${result.assistantItems.map((item) => item.id).join(", ")}`);
+  if (result.replySha256) lines.push(`reply sha256: ${result.replySha256}`);
   if (result.observationStatus === "unavailable") lines.push(`response observation: unavailable${result.observationReason ? ` - ${result.observationReason}` : ""}`);
   lines.push("", "--- Codex reply ---", result.text || (result.observationStatus === "unavailable"
     ? "(assistant response unavailable; inspect the original Codex Desktop task and do not resend automatically)"
-    : "(no assistant text was produced)"));
+    : result.responseStatus === "completed_no_reply" ? "(the exact completed turn produced no assistant reply)" : "(no assistant text was produced)"));
   if (result.status === "timeout") {
     lines.push(
       "",
@@ -738,9 +741,10 @@ registerTool(
   "read_codex_thread",
   {
     title: "Read a Codex thread",
-    description: "Read the recent conversation of a Codex thread without sending anything.",
+    description: "Read a Codex thread without sending anything. In Desktop mode, pass the exact turnId returned by send_to_codex_thread for authoritative assistant item IDs, text, and reply hash; without turnId the native recent-history view may omit items.",
     inputSchema: {
       threadId: z.string().describe("Codex thread id"),
+      turnId: z.string().optional().describe("Exact turn id to inspect authoritatively in Codex Desktop mode"),
       limit: z.number().int().min(1).max(50).optional().describe("How many recent messages to show (default 10)"),
     },
     annotations: {
@@ -748,10 +752,14 @@ registerTool(
       openWorldHint: true,
     },
   },
-  async ({ threadId, limit }) => {
+  async ({ threadId, turnId, limit }) => {
     try {
       if (desktopTasksEnabled) {
         const deadline = desktopOperation.getStore()?.deadline ?? Date.now() + DESKTOP_TOOL_BUDGET_MS;
+        if (turnId) {
+          const response = await desktopTasks.inspectNativeTurn(threadId, turnId, undefined, { deadline });
+          return textResult(JSON.stringify(response, null, 2), response.status === "unavailable");
+        }
         await desktopTasks.inspect(threadId, undefined, { deadline });
         const response = await desktopTasks.request("read_thread", { threadId, hostId: "local", turnLimit: Math.min(limit ?? 10, 10) }, { deadline });
         return textResult(JSON.stringify(response, null, 2));

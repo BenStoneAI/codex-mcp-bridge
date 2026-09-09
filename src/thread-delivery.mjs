@@ -3,7 +3,7 @@ import { runTurn } from "./turn.mjs";
 import { realpathSync } from "node:fs";
 import path from "node:path";
 import { DesktopTaskReceipts } from "./desktop-task-receipts.mjs";
-import { captureCodexRolloutWatermark, readCodexNativeTurnResponse } from "./codex-native-response.mjs";
+import { captureCodexRolloutWatermark, inspectCodexNativeTurn, readCodexNativeTurnResponse } from "./codex-native-response.mjs";
 
 /**
  * Which backend puts a message into a Codex thread.
@@ -48,7 +48,7 @@ export function matchDesktopProject(projects, cwd, { canonicalize = realpathSync
 }
 
 export class DesktopTaskDelivery {
-  constructor({ relay = new NativeDesktopRelay({ socketPath: desktopTaskSocketPath(), accountSocketPath: accountRelaySocketPath() }), security, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), now = Date.now, receipts = new DesktopTaskReceipts(), beforeRequest, accountContext, captureResponse = captureCodexRolloutWatermark, readResponse = readCodexNativeTurnResponse } = {}) {
+  constructor({ relay = new NativeDesktopRelay({ socketPath: desktopTaskSocketPath(), accountSocketPath: accountRelaySocketPath() }), security, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), now = Date.now, receipts = new DesktopTaskReceipts(), beforeRequest, accountContext, captureResponse = captureCodexRolloutWatermark, readResponse = readCodexNativeTurnResponse, inspectResponse = inspectCodexNativeTurn } = {}) {
     this.relay = relay;
     this.security = security;
     this.sleep = sleep;
@@ -58,6 +58,7 @@ export class DesktopTaskDelivery {
     this.accountContext = accountContext;
     this.captureResponse = captureResponse;
     this.readResponse = readResponse;
+    this.inspectResponse = inspectResponse;
     this.threadOperations = new Map();
   }
 
@@ -308,12 +309,31 @@ export class DesktopTaskDelivery {
     return observed;
   }
 
+  async inspectNativeTurn(threadId, turnId, cwd, { deadline } = {}) {
+    const initial = await this.inspect(threadId, cwd, { deadline });
+    const expectedCwd = realpathSync.native(initial.thread.cwd);
+    const accountContext = this.accountContext?.() ?? null;
+    const args = { threadId, hostId: "local", turnLimit: 1 };
+    const recheck = async () => {
+      await this.beforeRequest?.({ operation: "read_thread", args, phase: "inspect-turn" });
+      if (this.accountContext && !sameAccountContext(accountContext, this.accountContext())) throw new Error("The account changed while the native turn was being inspected; response content was withheld");
+      this.security.assertCwd(expectedCwd);
+      this.security.assertThread(threadId, expectedCwd);
+      if (realpathSync.native(expectedCwd) !== expectedCwd) throw new Error("The selected native task workspace changed while its turn was being inspected");
+    };
+    await recheck();
+    const result = this.inspectResponse({ threadId, turnId, expectedCwd });
+    await recheck();
+    await this.inspect(threadId, expectedCwd, { deadline });
+    await recheck();
+    return result;
+  }
+
   async wait(threadId, { timeoutMs = 240000, previousTurnId = null, responseObservation = null } = {}) {
     const startedAt = this.now();
     let cursor;
     let turnId = null;
-    let text = "";
-    const expired = () => ({ threadId, turnId, status: "timeout", text, activity: [], errors: [], durationMs: this.now() - startedAt });
+    const expired = () => ({ threadId, turnId, status: "timeout", text: "", responseStatus: "unavailable", assistantItems: [], replySha256: null, activity: [], errors: [], durationMs: this.now() - startedAt });
     for (;;) {
       if (this.now() - startedAt >= timeoutMs) return expired();
       let response;
@@ -335,22 +355,21 @@ export class DesktopTaskDelivery {
       }
       if (turn?.id && turn.id !== previousTurnId) {
         turnId = turn.id;
-        if (poll.latestAssistantMessage?.turnId === turnId && poll.latestAssistantMessage?.phase === "final_answer") text = poll.latestAssistantMessage.text ?? text;
         const status = turn.status;
         if (RELEASE_STATUSES.has(status)) {
-          let observationStatus = text ? "available" : "unavailable";
-          let observationReason;
-          if (responseObservation || !text) {
-            const observed = await this.observeNativeResponse(threadId, turnId, responseObservation, { deadline: startedAt + timeoutMs });
-            observationStatus = observed.status;
-            observationReason = observed.reason;
-            if (observed.status === "available" && text && text !== observed.text) {
-              observationStatus = "unavailable";
-              observationReason = "Native API text conflicts with the exact dispatch-bound final response; reply content was withheld.";
-            }
-            text = observationStatus === "available" ? observed.text : "";
-          }
-          return { threadId, turnId, status, text, observationStatus, ...(observationReason ? { observationReason } : {}), activity: [], errors: turn.error ? [turn.error] : [], durationMs: turn.durationMs ?? this.now() - startedAt };
+          const observed = await this.observeNativeResponse(threadId, turnId, responseObservation, { deadline: startedAt + timeoutMs });
+          const responseStatus = observed.status;
+          return {
+            threadId, turnId, status,
+            text: responseStatus === "completed" ? observed.text : "",
+            responseStatus,
+            observationStatus: responseStatus,
+            ...(observed.reason ? { observationReason: observed.reason } : {}),
+            assistantItems: observed.assistantItems ?? [],
+            replySha256: observed.replySha256 ?? null,
+            responseSource: observed.source ?? null,
+            activity: [], errors: turn.error ? [turn.error] : [], durationMs: turn.durationMs ?? this.now() - startedAt,
+          };
         }
       }
       if (this.now() - startedAt >= timeoutMs) return expired();

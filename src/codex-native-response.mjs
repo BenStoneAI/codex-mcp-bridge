@@ -163,6 +163,110 @@ function delegationOutput(executorThreadId, prompt) {
   return `<codex_delegation>\n  <source_thread_id>${executorThreadId}</source_thread_id>\n  <input>${prompt}</input>\n</codex_delegation>`;
 }
 
+function normalizedText(value) {
+  return value.replace(/\r\n?/g, "\n").normalize("NFC");
+}
+
+function replyHash(text) {
+  return crypto.createHash("sha256").update(normalizedText(text), "utf8").digest("hex");
+}
+
+function recordBelongsToTurn(entry, threadId, turnId) {
+  const payload = entry.record.payload;
+  const metadata = object(payload.internal_chat_message_metadata_passthrough) ? payload.internal_chat_message_metadata_passthrough : {};
+  const turnFields = [payload.turn_id, payload.root_turn_id, metadata.turn_id, metadata.root_turn_id].filter((value) => value !== undefined);
+  if (!turnFields.includes(turnId)) return false;
+  if (turnFields.some((value) => value !== turnId)) throw new Error("The native response contains contradictory turn identity");
+  const threadFields = [payload.thread_id, metadata.thread_id].filter((value) => value !== undefined);
+  if (threadFields.some((value) => value !== threadId)) throw new Error("The native response contains contradictory task identity");
+  return true;
+}
+
+function responseItemText(payload) {
+  if (!Array.isArray(payload.content) || payload.content.some((item) => !object(item) || item.type !== "output_text" || typeof item.text !== "string")) {
+    throw new Error("The native final response contains unsupported content");
+  }
+  return payload.content.map((item) => item.text).join("");
+}
+
+function completedEventText(item) {
+  if (!object(item) || item.type !== "AgentMessage" || item.phase !== "final_answer") return null;
+  if (!Array.isArray(item.content) || item.content.some((part) => !object(part) || part.type !== "Text" || typeof part.text !== "string")) {
+    throw new Error("The native completed assistant item contains unsupported content");
+  }
+  return item.content.map((part) => part.text).join("");
+}
+
+function inspectTurnRecords(records, threadId, turnId, cwd, { requireDispatch } = {}) {
+  const turns = records.filter((entry) => recordBelongsToTurn(entry, threadId, turnId));
+  const starts = turns.filter(({ record }) => record.type === "event_msg" && STARTED.has(record.payload.type));
+  const contexts = turns.filter(({ record }) => record.type === "turn_context");
+  const completions = turns.filter(({ record }) => record.type === "event_msg" && COMPLETED.has(record.payload.type));
+  const failures = turns.filter(({ record }) => record.type === "event_msg" &&
+    (FAILED.has(record.payload.type) || record.payload.error || ["failed", "aborted", "interrupted"].includes(record.payload.status)));
+  if (failures.length || starts.length !== 1 || contexts.length !== 1 || completions.length !== 1 ||
+      canonicalDirectory(contexts[0].record.payload.cwd, "The observed turn workspace") !== cwd ||
+      starts[0].start >= contexts[0].start || contexts[0].start >= completions[0].start) {
+    throw new Error("The native turn lifecycle is missing, ambiguous, failed, or out of order");
+  }
+
+  let dispatch = null;
+  if (requireDispatch) {
+    const dispatches = turns.filter(({ record }) => record.type === "response_item" && record.payload.type === "function_call_output" &&
+      record.payload.namespace === "codex_app" && record.payload.name === "send_message_to_thread");
+    if (dispatches.length !== 1 || dispatches[0].record.payload.output !== requireDispatch.output ||
+        contexts[0].start >= dispatches[0].start || dispatches[0].start >= completions[0].start) {
+      throw new Error("The newly observed turn is not correlated to the exact native dispatch");
+    }
+    dispatch = dispatches[0];
+  }
+
+  const allAssistantEntries = turns.filter(({ record }) => record.type === "response_item" && record.payload.type === "message" && record.payload.role === "assistant");
+  const finalEntries = allAssistantEntries.filter(({ record }) => record.payload.phase === "final_answer");
+  if (!finalEntries.length && allAssistantEntries.length) throw new Error("The completed native turn has assistant items but no final assistant reply");
+  const assistantItems = [];
+  const ids = new Set();
+  for (const entry of finalEntries) {
+    const { payload } = entry.record;
+    if (typeof payload.id !== "string" || !payload.id.trim() || ids.has(payload.id) ||
+        entry.start <= (dispatch?.start ?? contexts[0].start) || entry.start >= completions[0].start) {
+      throw new Error("The native final response item identity is missing, duplicated, or out of order");
+    }
+    ids.add(payload.id);
+    const text = responseItemText(payload);
+    if (!text.trim()) throw new Error("The native final response item is empty");
+    assistantItems.push({ id: payload.id, text });
+  }
+
+  const eventItems = new Map();
+  for (const { record, start } of turns) {
+    if (record.type !== "event_msg" || record.payload.type !== "item_completed") continue;
+    const text = completedEventText(record.payload.item);
+    if (text === null) continue;
+    const id = record.payload.item.id;
+    if (typeof id !== "string" || !id.trim() || eventItems.has(id) || start <= contexts[0].start || start >= completions[0].start) {
+      throw new Error("The native completed assistant item identity is missing, duplicated, or out of order");
+    }
+    eventItems.set(id, text);
+  }
+  for (const item of assistantItems) {
+    if (eventItems.has(item.id) && eventItems.get(item.id) !== item.text) throw new Error("The native assistant item representations conflict");
+  }
+  if ([...eventItems.keys()].some((id) => !ids.has(id))) throw new Error("The native completed assistant item has no matching authoritative response item");
+
+  const text = assistantItems.map((item) => item.text).join("\n\n");
+  if (Buffer.byteLength(text, "utf8") > MAX_REPLY_BYTES) throw new Error("The native final response exceeds the bounded reply limit");
+  return {
+    status: assistantItems.length ? "completed" : "completed_no_reply",
+    threadId,
+    turnId,
+    source: "codex_desktop_rollout",
+    assistantItems,
+    text,
+    replySha256: replyHash(text),
+  };
+}
+
 export function captureCodexRolloutWatermark({ threadId, expectedCwd }, { env = process.env, maxRolloutBytes = MAX_ROLLOUT_BYTES } = {}) {
   try {
     const cwd = canonicalDirectory(expectedCwd, "The selected native task workspace");
@@ -184,6 +288,20 @@ export function captureCodexRolloutWatermark({ threadId, expectedCwd }, { env = 
   }
 }
 
+export function inspectCodexNativeTurn({ threadId, turnId, expectedCwd }, { env = process.env, maxRolloutBytes = MAX_ROLLOUT_BYTES } = {}) {
+  try {
+    if (!UUID.test(threadId) || !UUID.test(turnId)) throw new Error("The native turn identity is invalid");
+    const cwd = canonicalDirectory(expectedCwd, "The selected native task workspace");
+    const found = findRollout(threadId, env);
+    const snapshot = readStable(found, maxRolloutBytes);
+    const records = parseRecords(snapshot.data);
+    validateSession(records, threadId, cwd);
+    return inspectTurnRecords(records, threadId, turnId, cwd);
+  } catch (error) {
+    return { ...unavailable(error), threadId, turnId, source: "codex_desktop_rollout", assistantItems: [], text: "", replySha256: null };
+  }
+}
+
 export function readCodexNativeTurnResponse({ threadId, turnId, previousTurnId, expectedCwd, executorThreadId, prompt, watermark }, { env = process.env, maxRolloutBytes = MAX_ROLLOUT_BYTES } = {}) {
   try {
     if (!UUID.test(threadId) || !UUID.test(turnId) || !UUID.test(executorThreadId)) throw new Error("The native response identity is invalid");
@@ -201,33 +319,11 @@ export function readCodexNativeTurnResponse({ threadId, turnId, previousTurnId, 
     const records = parseRecords(snapshot.data);
     validateSession(records, threadId, cwd);
     const tail = records.filter(({ start }) => start >= watermark.size);
-    const forTurn = ({ record }) => {
-      const metadata = object(record.payload?.internal_chat_message_metadata_passthrough) ? record.payload.internal_chat_message_metadata_passthrough : {};
-      const turnFields = [record.payload?.turn_id, record.payload?.root_turn_id, metadata.turn_id, metadata.root_turn_id].filter((value) => value !== undefined);
-      if (!turnFields.includes(turnId)) return false;
-      if (turnFields.some((value) => value !== turnId)) throw new Error("The native response contains contradictory turn identity");
-      const threadFields = [record.payload?.thread_id, metadata.thread_id].filter((value) => value !== undefined);
-      if (threadFields.some((value) => value !== threadId)) throw new Error("The native response contains contradictory task identity");
-      return true;
-    };
-    const turns = tail.filter(forTurn);
-    const starts = turns.filter(({ record }) => record.type === "event_msg" && STARTED.has(record.payload.type));
-    const contexts = turns.filter(({ record }) => record.type === "turn_context");
-    if (starts.length !== 1 || contexts.length !== 1 || canonicalDirectory(contexts[0].record.payload.cwd, "The observed turn workspace") !== cwd) throw new Error("The newly observed turn identity is incomplete or ambiguous");
-    const dispatches = turns.filter(({ record }) => record.type === "response_item" && record.payload.type === "function_call_output" &&
-      record.payload.namespace === "codex_app" && record.payload.name === "send_message_to_thread");
-    if (dispatches.length !== 1 || dispatches[0].record.payload.output !== delegationOutput(executorThreadId, prompt)) throw new Error("The newly observed turn is not correlated to the exact native dispatch");
-    const finals = turns.filter(({ record }) => record.type === "response_item" && record.payload.type === "message" &&
-      record.payload.role === "assistant" && record.payload.phase === "final_answer");
-    const completions = turns.filter(({ record }) => record.type === "event_msg" && COMPLETED.has(record.payload.type));
-    const failures = turns.filter(({ record }) => record.type === "event_msg" && (FAILED.has(record.payload.type) || record.payload.error || ["failed", "aborted", "interrupted"].includes(record.payload.status)));
-    if (failures.length || finals.length !== 1 || completions.length !== 1 || starts[0].start >= dispatches[0].start || contexts[0].start >= dispatches[0].start || dispatches[0].start >= finals[0].start || finals[0].start >= completions[0].start) throw new Error("The native final response is missing, ambiguous, failed, or out of order");
-    const content = finals[0].record.payload.content;
-    if (!Array.isArray(content) || !content.length || content.some((item) => !object(item) || item.type !== "output_text" || typeof item.text !== "string")) throw new Error("The native final response contains unsupported content");
-    const text = content.map((item) => item.text).join("");
-    if (!text.trim() || Buffer.byteLength(text, "utf8") > MAX_REPLY_BYTES) throw new Error("The native final response is empty or exceeds the bounded reply limit");
-    return { status: "available", text, turnId };
+    const inspected = inspectTurnRecords(tail, threadId, turnId, cwd, {
+      requireDispatch: { output: delegationOutput(executorThreadId, prompt) },
+    });
+    return { ...inspected, observationStatus: inspected.status };
   } catch (error) {
-    return unavailable(error);
+    return { ...unavailable(error), threadId, turnId, source: "codex_desktop_rollout", assistantItems: [], text: "", replySha256: null };
   }
 }

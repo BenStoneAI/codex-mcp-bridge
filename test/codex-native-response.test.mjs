@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it } from "node:test";
 
-import { captureCodexRolloutWatermark, readCodexNativeTurnResponse } from "../src/codex-native-response.mjs";
+import { captureCodexRolloutWatermark, inspectCodexNativeTurn, readCodexNativeTurnResponse } from "../src/codex-native-response.mjs";
 
 const THREAD_ID = "01a08745-d26e-7db2-aa9c-0758d52ea3e0";
 const TURN_ID = "01a087df-8988-7433-b08b-d85692b1f41a";
@@ -57,12 +57,54 @@ function fixture(t) {
 }
 
 describe("native Codex response observation", () => {
+  it("inspects the authoritative assistant item for one exact completed turn", (t) => {
+    const f = fixture(t);
+    const records = f.turn();
+    const assistantId = records[3].payload.id;
+    records.splice(3, 0, { type: "event_msg", payload: {
+      type: "item_completed", thread_id: THREAD_ID, turn_id: TURN_ID,
+      item: { type: "AgentMessage", id: assistantId, content: [{ type: "Text", text: "Received safely" }], phase: "final_answer" },
+    } });
+    f.append(records);
+    assert.deepEqual(inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: TURN_ID, expectedCwd: f.cwd }, { env: f.env }), {
+      status: "completed",
+      threadId: THREAD_ID,
+      turnId: TURN_ID,
+      source: "codex_desktop_rollout",
+      assistantItems: [{ id: assistantId, text: "Received safely" }],
+      text: "Received safely",
+      replySha256: crypto.createHash("sha256").update("Received safely").digest("hex"),
+    });
+  });
+
+  it("preserves exact native reply text while hashing normalized line endings and Unicode", (t) => {
+    const f = fixture(t);
+    const exact = " leading\r\ne\u0301 trailing ";
+    const records = f.turn({ content: [{ type: "output_text", text: exact }] });
+    f.append(records);
+    const result = inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: TURN_ID, expectedCwd: f.cwd }, { env: f.env });
+    assert.equal(result.text, exact);
+    assert.equal(result.assistantItems[0].text, exact);
+    assert.equal(result.replySha256, crypto.createHash("sha256").update(" leading\né trailing ".normalize("NFC")).digest("hex"));
+  });
+
   it("reads the exact final answer correlated to the newly dispatched native turn", (t) => {
     const f = fixture(t);
     const watermark = f.capture();
     assert.equal(watermark.status, "available");
-    f.append(f.turn());
-    assert.deepEqual(f.read(watermark), { status: "available", text: "Received safely", turnId: TURN_ID });
+    const records = f.turn();
+    const assistantId = records[3].payload.id;
+    f.append(records);
+    const observed = f.read(watermark);
+    const authoritative = inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: TURN_ID, expectedCwd: f.cwd }, { env: f.env });
+    assert.equal(observed.status, "completed");
+    assert.equal(observed.text, "Received safely");
+    assert.equal(observed.turnId, TURN_ID);
+    assert.deepEqual(observed.assistantItems, [{ id: assistantId, text: "Received safely" }]);
+    assert.deepEqual(
+      { assistantItems: observed.assistantItems, text: observed.text, replySha256: observed.replySha256 },
+      { assistantItems: authoritative.assistantItems, text: authoritative.text, replySha256: authoritative.replySha256 },
+    );
   });
 
   it("does not reuse an identical completed turn that existed before dispatch", (t) => {
@@ -70,6 +112,51 @@ describe("native Codex response observation", () => {
     f.append(f.turn());
     const watermark = f.capture();
     assert.equal(f.read(watermark).status, "unavailable");
+  });
+
+  it("reports an exact completed turn with zero final assistant items", (t) => {
+    const f = fixture(t);
+    const records = f.turn();
+    records.splice(3, 1);
+    f.append(records);
+    const result = inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: TURN_ID, expectedCwd: f.cwd }, { env: f.env });
+    assert.equal(result.status, "completed_no_reply");
+    assert.deepEqual(result.assistantItems, []);
+    assert.equal(result.text, "");
+    assert.equal(result.replySha256, crypto.createHash("sha256").update("").digest("hex"));
+  });
+
+  it("keeps two sequential turns in one task isolated by exact turn id", (t) => {
+    const f = fixture(t);
+    f.append(f.turn({ turnId: PREVIOUS_TURN_ID, content: [{ type: "output_text", text: "old reply" }] }));
+    f.append(f.turn({ content: [{ type: "output_text", text: "new reply" }] }));
+    const previous = inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: PREVIOUS_TURN_ID, expectedCwd: f.cwd }, { env: f.env });
+    const current = inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: TURN_ID, expectedCwd: f.cwd }, { env: f.env });
+    assert.equal(previous.text, "old reply");
+    assert.equal(current.text, "new reply");
+    assert.notEqual(previous.assistantItems[0].id, current.assistantItems[0].id);
+  });
+
+  it("rejects a conflicting completed-event representation of the same assistant item", (t) => {
+    const f = fixture(t);
+    const records = f.turn();
+    records.splice(3, 0, { type: "event_msg", payload: {
+      type: "item_completed", thread_id: THREAD_ID, turn_id: TURN_ID,
+      item: { type: "AgentMessage", id: records[3].payload.id, content: [{ type: "Text", text: "different" }], phase: "final_answer" },
+    } });
+    f.append(records);
+    assert.equal(inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: TURN_ID, expectedCwd: f.cwd }, { env: f.env }).status, "unavailable");
+  });
+
+  it("rejects a malformed exposed final assistant completion event", (t) => {
+    const f = fixture(t);
+    const records = f.turn();
+    records.splice(3, 0, { type: "event_msg", payload: {
+      type: "item_completed", thread_id: THREAD_ID, turn_id: TURN_ID,
+      item: { type: "AgentMessage", id: records[3].payload.id, content: [{ type: "ToolCall", text: "unsupported" }], phase: "final_answer" },
+    } });
+    f.append(records);
+    assert.equal(inspectCodexNativeTurn({ threadId: THREAD_ID, turnId: TURN_ID, expectedCwd: f.cwd }, { env: f.env }).status, "unavailable");
   });
 
   it("rejects the previous or a different turn", (t) => {
@@ -99,9 +186,17 @@ describe("native Codex response observation", () => {
     }
   });
 
-  it("does not treat commentary, tool content, or incomplete turns as a final reply", (t) => {
+  it("does not promote commentary to a final reply", (t) => {
+    const f = fixture(t);
+    const watermark = f.capture();
+    const records = f.turn();
+    records[3].payload.phase = "commentary";
+    f.append(records);
+    assert.equal(f.read(watermark).status, "unavailable");
+  });
+
+  it("does not treat tool content or incomplete turns as a final reply", (t) => {
     for (const mutation of [
-      (records) => { records[3].payload.phase = "commentary"; },
       (records) => { records[3].payload.content = [{ type: "tool_call", text: "not a reply" }]; },
       (records) => { records.pop(); },
     ]) {
