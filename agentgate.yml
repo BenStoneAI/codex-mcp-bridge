@@ -1,0 +1,9 @@
+# AgentGate configuration (agents provide claims; AgentGate determines status)
+tests_required:
+  - node --test --test-concurrency=1 test/hardened-bridge.test.mjs
+base_ref: null
+deploy_target: null
+version_url: null
+health_url: null
+user_visible:
+max_age_hours: 24

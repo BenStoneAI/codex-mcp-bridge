@@ -7,6 +7,8 @@ import path from "node:path";
 
 import { homeDir, IS_WINDOWS } from "./platform.mjs";
 import { cloneReloadState } from "./reload-control.mjs";
+import { hardenedBridgeEnabled } from "./hardened-root-policy.mjs";
+import { protectCurrentUserPipe } from "./windows-pipe-acl.mjs";
 
 const SOCKET_DIR = "/tmp/cc-socks";
 
@@ -346,7 +348,7 @@ export function readTranscriptReply(sessionId, cwd, msgId) {
  * answer on and the conversation stays one-way.
  */
 export class PeerEndpoint {
-  constructor({ name = `codex-${process.pid}`, cwd = process.cwd(), log = () => {} } = {}) {
+  constructor({ name = `codex-${process.pid}`, cwd = process.cwd(), log = () => {}, env = process.env, protectSocket } = {}) {
     this.name = name;
     this.cwd = cwd;
     this.log = log;
@@ -371,6 +373,13 @@ export class PeerEndpoint {
     this.activityRevision = 0;
     this.reloadPaused = false;
     this.processHandlersRegistered = false;
+    this.strict = hardenedBridgeEnabled(env);
+    this.protectSocket = protectSocket ?? (hardenedBridgeEnabled(env) ? protectCurrentUserPipe : null);
+    this.aclReady = !IS_WINDOWS || !this.protectSocket;
+    this.provisionalSockets = new Set();
+    this.startGeneration = 0;
+    this.startPromise = null;
+    this.closed = Promise.resolve();
   }
 
   /**
@@ -400,9 +409,19 @@ export class PeerEndpoint {
     }
   }
 
-  async start() {
+  start() {
     if (this.reloadPaused) throw new Error("The peer endpoint is quiesced for reload");
     if (this.started) return;
+    if (this.startPromise) return this.startPromise;
+    const starting = this.#startOnce();
+    const shared = starting.finally(() => {
+      if (this.startPromise === shared) this.startPromise = null;
+    });
+    this.startPromise = shared;
+    return shared;
+  }
+
+  async #startOnce() {
     this.#sweepDeadBridges();
     const procStart = readProcessStart(this.pid);
     const peerToken = crypto.randomBytes(16).toString("hex");
@@ -413,12 +432,34 @@ export class PeerEndpoint {
     fs.mkdirSync(sessionsDir(), { recursive: true });
     if (!IS_WINDOWS && fs.existsSync(this.socketPath)) fs.rmSync(this.socketPath, { force: true });
 
+    const generation = ++this.startGeneration;
+    this.aclReady = !IS_WINDOWS || !this.protectSocket;
     await new Promise((resolve, reject) => {
       this.server = net.createServer((socket) => this.#handleConnection(socket));
       this.server.on("error", reject);
       this.server.listen(this.socketPath, resolve);
     });
     if (!IS_WINDOWS) fs.chmodSync(this.socketPath, 0o600);
+    if (IS_WINDOWS && this.protectSocket) {
+      try {
+        await this.protectSocket(this.socketPath);
+        if (generation !== this.startGeneration) throw new Error("Peer pipe ACL startup was cancelled");
+        this.aclReady = true;
+        for (const socket of this.provisionalSockets) socket.destroy();
+        this.provisionalSockets.clear();
+      } catch (error) {
+        for (const socket of this.provisionalSockets) socket.destroy();
+        this.provisionalSockets.clear();
+        await this.#closeServer();
+        throw error;
+      }
+    }
+    if (generation !== this.startGeneration) {
+      for (const socket of this.provisionalSockets) socket.destroy();
+      this.provisionalSockets.clear();
+      await this.#closeServer();
+      throw new Error("Peer endpoint startup was cancelled");
+    }
 
     const processIdentity = procStart ? (IS_WINDOWS ? { procStartFt: procStart } : { procStart }) : {};
     this.registry = {
@@ -453,7 +494,26 @@ export class PeerEndpoint {
     this.log(`peer "${this.name}" listening on ${this.socketPath}`);
   }
 
+  #closeServer() {
+    const server = this.server;
+    return new Promise((resolve) => {
+      if (!server) return resolve();
+      try {
+        if (!server.listening) return resolve();
+        server.close(() => resolve());
+      } catch {
+        resolve();
+      }
+    });
+  }
+
   #handleConnection(socket) {
+    if (IS_WINDOWS && !this.aclReady) {
+      this.provisionalSockets.add(socket);
+      socket.once("close", () => this.provisionalSockets.delete(socket));
+      socket.once("error", () => {});
+      return;
+    }
     this.activityRevision += 1;
     this.connections.add(socket);
     socket.once("close", () => this.connections.delete(socket));
@@ -517,18 +577,25 @@ export class PeerEndpoint {
   }
 
   #receiveMessage(message) {
+    const key = message.inReplyTo ?? [...this.pendingMessages].find(([, entry]) => entry.targetSocket === message.fromSocket)?.[0];
+    const pending = this.pendingMessages.get(key);
+    const correlated = pending && (!pending.transcriptSession || (message.source === "transcript" && message.inReplyTo === key));
+    if (this.strict && !(key && correlated && pending.targetSocket === message.fromSocket)) {
+      this.log(`ignored uncorrelated inbound peer message from ${message.fromSocket ?? "?"} in hardened mode`);
+      return;
+    }
     this.activityRevision += 1;
     const record = { ...message, receivedAt: Date.now(), sequence: ++this.messageSequence };
     this.inbox.push(record);
-    const key = record.inReplyTo ?? [...this.pendingMessages].find(([, entry]) => entry.targetSocket === record.fromSocket)?.[0];
-    const pending = this.pendingMessages.get(key);
-    const correlated = pending && (!pending.transcriptSession || (record.source === "transcript" && record.inReplyTo === key));
     if (key && correlated && pending.targetSocket === record.fromSocket) {
       const sent = this.sentMessages.get(key);
       if (sent) {
         record.inReplyTo = key;
         record.replyThreadId = sent.replyThreadId ?? null;
         record.accountContext = sent.accountContext ?? null;
+        record.cwd = sent.transcriptSession?.cwd ?? null;
+        record.senderCwd = sent.scopeBindings?.sender?.path ?? null;
+        record.scopeBindings = sent.scopeBindings ?? null;
         sent.reply = record;
       }
       this.#removePendingReply(record.fromSocket, key);
@@ -646,7 +713,7 @@ export class PeerEndpoint {
     return frame.msg_id;
   }
 
-  async sendAndWait(targetSocket, text, { timeoutMs = 120000, priority = "next", transcriptSession, beforeSend, permissionMode = this.permissionMode, replyThreadId, senderReview, senderApprovalPolicy, recipient, accountContext } = {}) {
+  async sendAndWait(targetSocket, text, { timeoutMs = 120000, priority = "next", transcriptSession, beforeSend, permissionMode = this.permissionMode, replyThreadId, senderReview, senderApprovalPolicy, recipient, accountContext, scopeBindings } = {}) {
     const previous = this.requestQueues.get(targetSocket) ?? Promise.resolve();
     const pending = previous.catch(() => {}).then(async () => {
       await beforeSend?.();
@@ -664,7 +731,7 @@ export class PeerEndpoint {
       this.unconfirmedReplies.set(targetSocket, unconfirmed + 1);
       let msgId = crypto.randomUUID();
       this.pendingMessages.set(msgId, { targetSocket, transcriptSession });
-      this.sentMessages.set(msgId, { targetSocket, transcriptSession, sentAt: since, replyThreadId, permissionMode, senderApprovalPolicy, ...(senderReview ? { senderReview: { ...senderReview } } : {}), ...(recipient ? { recipient: { ...recipient } } : {}), ...(accountContext ? { accountContext: Object.freeze({ ...accountContext }) } : {}) });
+      this.sentMessages.set(msgId, { targetSocket, transcriptSession, sentAt: since, replyThreadId, permissionMode, senderApprovalPolicy, ...(senderReview ? { senderReview: { ...senderReview } } : {}), ...(recipient ? { recipient: { ...recipient } } : {}), ...(accountContext ? { accountContext: Object.freeze({ ...accountContext }) } : {}), ...(scopeBindings ? { scopeBindings: Object.freeze(structuredClone(scopeBindings)) } : {}) });
       if (transcriptSession && !this.responsePoll) {
         this.responsePoll = globalThis.setInterval(() => this.#refreshTranscriptReplies(), 250);
         this.responsePoll.unref();
@@ -778,6 +845,7 @@ export class PeerEndpoint {
       ...(sent.recipient ? { recipientPermissionMode: sent.recipient.permissionMode ?? null, recipientPermissionClass: sent.recipient.permissionClass ?? null, recipientInboundPolicy: sent.recipient.inboundPolicy ?? null } : {}),
       replyThreadId: sent.replyThreadId ?? null,
       ...(sent.accountContext ? { accountContext: { ...sent.accountContext } } : {}),
+      ...(sent.scopeBindings ? { scopeBindings: structuredClone(sent.scopeBindings), senderCwd: sent.scopeBindings.sender?.path ?? null } : {}),
       pending: this.pendingMessages.has(msgId),
       ...(sent.reply ? { reply: sent.reply.text, source: sent.reply.source ?? "peer", ...(sent.reply.absorbed ? { replyAbsorbed: true } : {}), ...(sent.reply.forwardingError ? { forwardingError: { ...sent.reply.forwardingError } } : {}) } : {}),
     };
@@ -863,12 +931,19 @@ export class PeerEndpoint {
   }
 
   stop() {
+    this.startGeneration += 1;
+    this.aclReady = !IS_WINDOWS || !this.protectSocket;
+    for (const socket of this.provisionalSockets) socket.destroy();
+    this.provisionalSockets.clear();
     globalThis.clearInterval(this.responsePoll);
     this.responsePoll = null;
     this.pendingMessages.clear();
-    try {
-      this.server?.close();
-    } catch {}
+    const server = this.server;
+    this.closed = new Promise((resolve) => {
+      if (!server) return resolve();
+      try { server.close(() => resolve()); }
+      catch { resolve(); }
+    });
     for (const socket of this.connections) socket.destroy();
     this.connections.clear();
     this.#removeRegistration();
