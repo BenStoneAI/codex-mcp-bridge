@@ -135,6 +135,26 @@ function creationReceipts(home) {
 }
 
 describe("Desktop task MCP integration", () => {
+  it("reports an unavailable response explicitly without resending a completed native turn", async () => {
+    const calls = [];
+    let sent = false;
+    await withDesktopReceiptBridge(async ({ operation, arguments: args }, home) => {
+      calls.push(operation);
+      if (operation === "read_thread") return { thread: { id: args.threadId, hostId: "local", cwd: home }, turns: [{ id: sent ? "new-turn" : "old-turn" }] };
+      if (operation === "send_message_to_thread") { sent = true; return { threadId: args.threadId, status: "accepted" }; }
+      if (operation === "wait_threads") return { polls: [{ thread: { id: args.targets[0].threadId, hostId: "local", status: { type: "idle" } }, latestTurn: { id: "new-turn", status: "completed" }, latestAssistantMessage: null }] };
+      throw new Error(`Unexpected operation ${operation}`);
+    }, async ({ client }) => {
+      const result = await client.callTool({ name: "send_to_codex_thread", arguments: { threadId: "target", prompt: "one native send", openInApp: false } });
+      assert.equal(result.isError, undefined);
+      assert.match(result.content[0].text, /response observation: unavailable/);
+      assert.match(result.content[0].text, /assistant response unavailable.*do not resend/i);
+      assert.equal(calls.filter((operation) => operation === "send_message_to_thread").length, 1);
+      assert.equal(calls.includes("create_thread"), false);
+      assert.deepEqual(calls, ["read_thread", "send_message_to_thread", "wait_threads", "read_thread"]);
+    });
+  });
+
   it("withholds a delayed reply when the account changes after the explicit task was dispatched", async () => {
     const calls = [];
     let changeAccount;

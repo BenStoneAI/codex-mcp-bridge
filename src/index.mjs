@@ -309,7 +309,10 @@ function formatTurn(result, { desktop = false } = {}) {
   if (result.errors.length) {
     lines.push(`errors: ${result.errors.map((e) => e.message ?? JSON.stringify(e)).join(" | ")}`);
   }
-  lines.push("", "--- Codex reply ---", result.text || "(no assistant text was produced)");
+  if (result.observationStatus === "unavailable") lines.push(`response observation: unavailable${result.observationReason ? ` - ${result.observationReason}` : ""}`);
+  lines.push("", "--- Codex reply ---", result.text || (result.observationStatus === "unavailable"
+    ? "(assistant response unavailable; inspect the original Codex Desktop task and do not resend automatically)"
+    : "(no assistant text was produced)"));
   if (result.status === "timeout") {
     lines.push(
       "",
@@ -539,7 +542,7 @@ registerTool(
             }
           }
           try {
-            const result = await desktopTasks.wait(threadId, { timeoutMs: Math.max(0, deadline - Date.now()), previousTurnId: delivered.previousTurnId });
+            const result = await desktopTasks.wait(threadId, { timeoutMs: Math.max(0, deadline - Date.now()), previousTurnId: delivered.previousTurnId, responseObservation: delivered.responseObservation });
             return textResult([...notes, formatTurn(result, { desktop: true })].join("\n"), result.status === "failed" || result.status === "systemError");
           } catch (err) {
             return textResult([...notes, `threadId: ${threadId}`, `Task was accepted; observation failed: ${err.message}. Do not resend.`].join("\n"), true);
