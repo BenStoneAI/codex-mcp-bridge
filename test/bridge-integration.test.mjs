@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { startFakeAppServer } from "./helpers/fake-app-server.mjs";
@@ -16,6 +17,7 @@ import { readCodexAccountContext } from "../src/codex-account-context.mjs";
 import { assertAccountIdentity } from "../src/bridge-account-context.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const execute = promisify(execFile);
 const CLAUDE_ACCOUNT_A = "11111111-1111-4111-8111-111111111111";
 const CLAUDE_ACCOUNT_B = "22222222-2222-4222-8222-222222222222";
 
@@ -48,7 +50,11 @@ async function desktopCallerFixture(home, env) {
   fs.mkdirSync(registry, { recursive: true });
   const endpoint = path.join(home, "unused-peer-endpoint");
   fs.writeFileSync(endpoint, "");
-  const [parent] = await readProcessAncestry({ parentPid: process.pid, maxDepth: 1 });
+  const [parent] = await readProcessAncestry({ parentPid: process.pid, maxDepth: 1,
+    run: (command, args, options) => execute(command, args, {
+      ...options, timeout: process.platform === "win32" ? 15000 : options.timeout,
+    }),
+  });
   assert.ok(parent?.processStart);
   const registryFile = path.join(registry, `${process.pid}.json`);
   fs.writeFileSync(registryFile, JSON.stringify({ pid: process.pid, sessionId: "fixture-caller", cwd: home, entrypoint: "claude-desktop", messagingSocketPath: endpoint, [process.platform === "win32" ? "procStartFt" : "procStart"]: parent.processStart }));
