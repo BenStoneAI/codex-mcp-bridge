@@ -30,6 +30,9 @@ import { createRuntimeState } from "./runtime-state.mjs";
 import { assertRoutingReload, clientReloadReason, createReloadControl } from "./reload-control.mjs";
 import { accountIdentity, assertAccountIdentity, publicAccountState, readBridgeAccounts, requireBridgeAccounts } from "./bridge-account-context.mjs";
 import { assertClaudeSenderContext, readClaudeSenderContext, requireClaudeSenderContext } from "./claude-sender-context.mjs";
+import { createPeerAuthRuntime } from "./peer-auth-runtime.mjs";
+import { registerPeerAuthTools } from "./peer-auth-mcp.mjs";
+import { assertNativeCodexPeer } from "./peer-auth-native.mjs";
 
 exitForVersionRequest(import.meta.url);
 
@@ -56,6 +59,7 @@ const desktopTasksEnabled = desktopTasksConfigured();
 const runtime = createRuntimeState({ configuration: desktopTasksConfigured });
 const desktopOperation = new AsyncLocalStorage();
 const desktopTasks = new DesktopTaskDelivery({ security, beforeRequest: beforeDesktopRequest, accountContext: () => desktopOperation.getStore()?.accounts });
+const peerAuth = createPeerAuthRuntime("claude");
 
 async function assertDesktopOperation(context, { verifyProcess = false } = {}) {
   if (!context || context.diagnostic) return;
@@ -390,6 +394,31 @@ function registerTool(name, definition, handler) {
   });
 }
 
+async function currentClaudePeerIdentity() {
+  const context = desktopOperation.getStore();
+  if (!context || context.diagnostic) throw new Error("Authenticated peer tools require a verified Claude Desktop task");
+  await assertDesktopOperation(context);
+  const accounts = readBridgeAccounts();
+  const caller = requireClaudeSenderContext(await readClaudeSenderContext({ account: accounts.claude }));
+  return { identity: peerAuth.identity({ agent: "claude", accountFingerprint: accounts.claude.fingerprint, taskId: caller.taskId, sessionId: caller.sessionId, turnId: caller.turnId, cwd: caller.cwd }), peerMessageId: caller.peerMessageId, nativeOrigin: caller.nativeOrigin };
+}
+
+async function resolveCodexPeerIdentity(signed, _extra, envelope = null) {
+  const context = desktopOperation.getStore();
+  const scope = envelope?.scope ?? signed.scope;
+  await assertDesktopOperation(context);
+  const inspected = await desktopTasks.inspect(signed.task_id, scope?.canonical_cwd, { deadline: context.deadline });
+  if (signed.turn_id) {
+    const observed = await desktopTasks.inspectNativeTurn(signed.task_id, signed.turn_id, scope?.canonical_cwd, { deadline: context.deadline });
+    if (observed.status === "unavailable") throw new Error("The signed Codex turn is not available for native revalidation");
+  }
+  const accounts = readBridgeAccounts();
+  const identity = peerAuth.identity({ agent: "codex", accountFingerprint: accounts.codex.fingerprint, taskId: signed.task_id, sessionId: signed.session_id, turnId: signed.turn_id ?? null, cwd: inspected.thread.cwd });
+  return assertNativeCodexPeer({ relay: desktopTasks.relay, identity, accountContext: context.accounts, beforeSend: () => assertDesktopOperation(context) });
+}
+
+registerPeerAuthTools({ registerTool, z, runtime: peerAuth, currentIdentity: currentClaudePeerIdentity, resolvePeerIdentity: resolveCodexPeerIdentity });
+
 registerTool(
   "delegate_to_codex",
   {
@@ -434,6 +463,7 @@ registerTool(
     const shouldRelease = releaseAfterTurn ?? DEFAULT_RELEASE_AFTER_TURN;
     const notes = [];
     try {
+      if (peerAuth) throw new Error("Authenticated peer mode permits sends only to an already granted exact Codex task; new task creation is disabled");
       if (desktopTasksEnabled) return await delegateDesktopTask({ cwd, prompt, name, model, effort, timeoutSec, openInApp });
       const created = await createCodexThread({ cwd, prompt, name, model });
       if (created.workspace.note) notes.push(created.workspace.note);
@@ -516,6 +546,8 @@ registerTool(
         .boolean()
         .optional()
         .describe("Unsubscribe this thread after a terminal turn; open Desktop only after its unload is confirmed"),
+      requested_capability: z.enum(["read_only", "review_only", "edit_project", "run_tests"]).optional().describe("Authenticated peer capability (default read_only)"),
+      parent_message_id: z.string().uuid().nullable().optional().describe("Consumed peer request parent for peer-derived work; omit only for a native human-root turn"),
     },
     annotations: {
       readOnlyHint: false,
@@ -524,7 +556,8 @@ registerTool(
       openWorldHint: true,
     },
   },
-  async ({ threadId, prompt, timeoutSec, cwd, model, effort, name, openInApp, releaseAfterTurn }) => {
+  async ({ threadId, prompt, timeoutSec, cwd, model, effort, name, openInApp, releaseAfterTurn, requested_capability, parent_message_id }) => {
+    if (peerAuth && !desktopTasksEnabled) throw new Error("Authenticated peer mode requires the exact native Codex Desktop task route; app-server sends are disabled");
     const deadline = desktopTasksEnabled ? desktopOperation.getStore()?.deadline ?? Date.now() + Math.min((timeoutSec ?? 40) * 1000, DESKTOP_TOOL_BUDGET_MS) : undefined;
     return (desktopTasksEnabled ? desktopTasks : client).withThread(threadId, async () => {
       const notes = [];
@@ -534,6 +567,22 @@ registerTool(
         if (desktopTasksEnabled) {
           const workspace = cwd ? resolveWorkspacePath(cwd) : null;
           if (workspace) security.assertCwd(workspace.path);
+          if (peerAuth) {
+            const inspected = await desktopTasks.inspect(threadId, workspace?.path);
+            const targetCwd = workspace?.path ?? inspected.thread.cwd;
+            const initial = await currentClaudePeerIdentity();
+            if (initial.nativeOrigin === "peer" && (!initial.peerMessageId || parent_message_id !== initial.peerMessageId)) throw Object.assign(new Error("A peer-derived Claude turn requires its exact verified parent_message_id"), { code: "INVALID_PARENT" });
+            const recipient = peerAuth.identity({ agent: "codex", accountFingerprint: desktopOperation.getStore().accounts.codex, taskId: threadId, sessionId: null, turnId: null, cwd: targetCwd });
+            const issued = await peerAuth.service.issueRequest({
+              text: prompt, sender: initial.identity, recipient, requestedCapability: requested_capability ?? "read_only", parentMessageId: parent_message_id ?? null,
+              revalidateSender: async () => (await currentClaudePeerIdentity()).identity,
+              revalidateRecipient: () => resolveCodexPeerIdentity(recipient, null, { scope: { canonical_cwd: recipient.canonical_cwd } }),
+              transport: async ({ marker }) => { await desktopTasks.send({ threadId, prompt: marker, cwd: targetCwd, model: model ?? DEFAULT_MODEL, effort: effort ?? DEFAULT_EFFORT, name, deadline }); },
+            });
+            notes.push("sent one opaque authenticated marker through Codex Desktop", `cwd: ${targetCwd}`, `message_id: ${issued.message_id}`);
+            if (shouldOpen) { try { await desktopTasks.open(threadId, { deadline }); notes.push("opened in Codex Desktop while the task runs"); } catch (error) { notes.push(`task was accepted; opening its page failed: ${error.message}`); } }
+            return { ...textResult(JSON.stringify({ status: "PENDING", message_id: issued.message_id })), structuredContent: { peerAuth: { status: "PENDING", message_id: issued.message_id }, request: issued } };
+          }
           const delivered = await desktopTasks.send({ threadId, prompt, cwd: workspace?.path, model: model ?? DEFAULT_MODEL, effort: effort ?? DEFAULT_EFFORT, name, deadline });
           notes.push("sent through Codex Desktop; no external app-server writer", `cwd: ${delivered.cwd}`);
           if (shouldOpen) {
@@ -715,6 +764,7 @@ registerTool(
   },
   async ({ cwd, model, name, prompt }) => {
     try {
+      if (peerAuth) throw new Error("Authenticated peer mode does not permit ungranted new task creation");
       if (desktopTasksEnabled) {
         if (!prompt?.trim()) throw new Error("Desktop task creation requires the initial prompt. Use delegate_to_codex, or pass prompt to start_codex_thread. No task was created.");
         return await delegateDesktopTask({ cwd, model, name, prompt, waitForReply: false });
@@ -920,7 +970,7 @@ registerTool(
     const summary = security.summary();
     if (desktopTasksEnabled) {
       const native = await desktopTasks.status();
-      return textResult([
+      const result = textResult([
         `platform:       ${PLATFORM_LABEL} (${process.platform}/${process.arch})`,
         `bridge version: ${VERSION}`,
         `node:           ${process.version} at ${process.execPath}`,
@@ -933,6 +983,8 @@ registerTool(
         `security:       thread policy ${security.threadPolicy}, ${summary.allowAllRoots ? "all directories" : `${summary.allowedRoots.length} allowed root(s)`}; task permissions belong to Codex Desktop`,
         `claude desktop config: ${claudeDesktopConfigPath()}`,
       ].join("\n"), !native.available);
+      if (peerAuth) result.structuredContent = { peerAuth: peerAuth.status() };
+      return result;
     }
     const up = await client.isServerUp();
     let liveThreads = null;

@@ -8,7 +8,7 @@ import { PLATFORM_LABEL } from "./platform.mjs";
 import { PeerEndpoint, assertClaudeSessionCwd, assertClaudeSessionProcess, findClaudeSession, listClaudeSessions, readTranscript } from "./peer-protocol.mjs";
 import { createThreadDelivery } from "./thread-delivery.mjs";
 import { exitForVersionRequest } from "./cli-version.mjs";
-import { desktopTasksConfigured } from "./native-relay.mjs";
+import { desktopTasksConfigured, NativeDesktopRelay } from "./native-relay.mjs";
 import { createRuntimeState } from "./runtime-state.mjs";
 import { readClaudeDesktopContext } from "./claude-desktop-context.mjs";
 import { readClaudeInboundPolicy } from "./claude-inbound-policy.mjs";
@@ -20,6 +20,9 @@ import { readClaudeAccountContext } from "./desktop-account-context.mjs";
 import { assertAccountIdentity, bindUnsolicitedClaudeMessageAccount, publicAccountState, readBridgeAccounts, requireBridgeAccounts, sameAccountIdentity } from "./bridge-account-context.mjs";
 import { resolveClaudeDesktopSession, sameClaudeDesktopRecipient } from "./claude-session-router.mjs";
 import { createHardenedRootPolicy } from "./hardened-root-policy.mjs";
+import { createPeerAuthRuntime } from "./peer-auth-runtime.mjs";
+import { registerPeerAuthTools } from "./peer-auth-mcp.mjs";
+import { assertNativeCodexPeer } from "./peer-auth-native.mjs";
 
 exitForVersionRequest(import.meta.url);
 
@@ -33,6 +36,8 @@ const defaultPeerName = process.env.CLAUDE_BRIDGE_PEER_NAME ?? `codex-${process.
 const desktopOnly = desktopTasksConfigured();
 const rootPolicy = createHardenedRootPolicy();
 const runtime = createRuntimeState({ configuration: desktopTasksConfigured });
+const peerAuth = createPeerAuthRuntime("codex");
+const peerAuthRelay = peerAuth ? new NativeDesktopRelay() : null;
 
 const peer = new PeerEndpoint({
   name: defaultPeerName,
@@ -169,6 +174,7 @@ function forwardToCodexThread(record) {
 }
 
 peer.onMessage((record) => {
+  if (peerAuth) { record.forwardingError = { status: "blocked", reasonCode: "AUTHENTICATED_RAW_FORWARDING_DISABLED", reason: "Authenticated mode accepts replies only through the signed peer reply store" }; return; }
   if (rootPolicy.enabled && !record.cwd) { record.forwardingError = { status: "blocked", reasonCode: "ROOT_UNAUTHORIZED", reason: "Unsolicited inbound messages are disabled in hardened mode without a verified root binding" }; return; }
   try { if (rootPolicy.enabled) rootPolicy.assert(record.cwd, "Inbound Claude message working directory"); }
   catch (err) { record.forwardingError = { status: "blocked", reasonCode: "ROOT_UNAUTHORIZED", reason: err.message }; return; }
@@ -203,6 +209,26 @@ function registerTool(name, definition, handler) {
     catch (error) { return failure(error); }
   });
 }
+
+async function currentCodexPeerIdentity(extra) {
+  const sender = assertSender(extra?._meta);
+  const accounts = readBridgeAccounts();
+  requireBridgeAccounts(accounts);
+  const identity = peerAuth.identity({ agent: "codex", accountFingerprint: accounts.codex.fingerprint, taskId: sender.threadId, sessionId: null, turnId: sender.turnId, cwd: sender.cwd });
+  await assertNativeCodexPeer({ relay: peerAuthRelay, identity, accountContext: requireBridgeAccounts(accounts), beforeSend: () => { assertAccountIdentity(requireBridgeAccounts(accounts)); const current = assertSender(extra?._meta); if (current.threadId !== sender.threadId || current.turnId !== sender.turnId || current.cwd !== sender.cwd) throw new Error("Native Codex sender changed during peer authorization"); } });
+  return { identity, peerMessageId: sender.peerMessageId ?? null, nativeOrigin: sender.nativeOrigin };
+}
+
+async function resolveClaudePeerIdentity(signed, _extra, envelope = null) {
+  const scope = envelope?.scope ?? signed.scope;
+  const accounts = readBridgeAccounts();
+  requireBridgeAccounts(accounts);
+  const session = resolveClaudeDesktopSession({ target: signed.session_id, expectedCwd: scope?.canonical_cwd, expectedTaskId: signed.task_id, sessions: listClaudeSessions(), account: accounts.claude, readContext: (candidate, account) => readClaudeDesktopContext(candidate, { account }) });
+  assertClaudeSessionProcess(session);
+  return peerAuth.identity({ agent: "claude", accountFingerprint: accounts.claude.fingerprint, taskId: session.desktop.taskId, sessionId: session.sessionId, turnId: signed.turn_id ?? null, cwd: session.cwd });
+}
+
+registerPeerAuthTools({ registerTool, z, runtime: peerAuth, currentIdentity: currentCodexPeerIdentity, resolvePeerIdentity: resolveClaudePeerIdentity });
 
 registerTool(
   "list_claude_sessions",
@@ -266,6 +292,8 @@ registerTool(
         .max(1800)
         .optional()
         .describe("How long to wait for Claude's reply (default 180, 0 = do not wait)"),
+      requested_capability: z.enum(["read_only", "review_only", "edit_project", "run_tests"]).optional().describe("Authenticated peer capability (default read_only)"),
+      parent_message_id: z.string().uuid().nullable().optional().describe("Consumed peer request parent for peer-derived work; omit only for a native human-root turn"),
     },
     annotations: {
       readOnlyHint: false,
@@ -274,7 +302,7 @@ registerTool(
       openWorldHint: true,
     },
   },
-  async ({ target, message, waitSec, expectedCwd, expectedTaskId }, extra) => {
+  async ({ target, message, waitSec, expectedCwd, expectedTaskId, requested_capability, parent_message_id }, extra) => {
     try {
       runtime.assertCurrent();
       const accounts = desktopOnly ? readBridgeAccounts() : null;
@@ -300,6 +328,41 @@ registerTool(
       if (desktopOnly) assertRecipientClass(session, sender);
       await peer.start();
 
+      const revalidateDestination = () => {
+        runtime.assertCurrent();
+        if (desktopOnly) assertAccountIdentity(selectedAccounts);
+        const current = findClaudeSession(session.sessionId ?? String(session.pid), { desktopOnly });
+        const destinationUnchanged = desktopOnly ? sameClaudeDesktopRecipient(session, current) : Boolean(current && current.pid === session.pid && current.socket === session.socket);
+        if (!destinationUnchanged) throw new Error("The Claude destination changed while this message was queued. No message was sent; inspect the existing Desktop session.");
+        if (desktopOnly || expectedCwd !== undefined) assertClaudeSessionCwd(current, expectedCwd);
+        assertSessionRoot(current);
+        if (desktopOnly) {
+          assertClaudeSessionProcess(current);
+          const refreshed = withDesktopContext(current, readClaudeAccountContext());
+          assertDesktopTask(refreshed, selectedTaskId);
+          const active = assertSender(extra?._meta);
+          if (rootPolicy.enabled) { rootPolicy.recheck(scopeBindings.sender, "Codex sender working directory"); rootPolicy.recheck(scopeBindings.recipient, "Claude recipient working directory"); }
+          if (active.threadId !== sender.threadId || active.turnId !== sender.turnId || active.cwd !== sender.cwd || active.mode !== sender.mode || active.approvalPolicy !== sender.approvalPolicy || JSON.stringify(active.review) !== JSON.stringify(sender.review)) throw preflightFailure("CODEX_SENDER_CONTEXT_CHANGED", "The sender's active turn or permissions changed while this message was queued.");
+          assertRecipientClass(refreshed, active); assertAccountIdentity(selectedAccounts);
+          return refreshed;
+        }
+        return current;
+      };
+
+      if (peerAuth) {
+        if (!desktopOnly) throw new Error("Authenticated peer messaging requires native Desktop identity checks");
+        const initial = await currentCodexPeerIdentity(extra);
+        if (initial.nativeOrigin === "peer" && (!initial.peerMessageId || parent_message_id !== initial.peerMessageId)) throw Object.assign(new Error("A peer-derived Codex turn requires its exact verified parent_message_id"), { code: "INVALID_PARENT" });
+        const recipient = peerAuth.identity({ agent: "claude", accountFingerprint: accounts.claude.fingerprint, taskId: session.desktop.taskId, sessionId: session.sessionId, turnId: null, cwd: session.cwd });
+        const issued = await peerAuth.service.issueRequest({
+          text: message, sender: initial.identity, recipient, requestedCapability: requested_capability ?? "read_only", parentMessageId: parent_message_id ?? null,
+          revalidateSender: async () => (await currentCodexPeerIdentity(extra)).identity,
+          revalidateRecipient: () => { const current = revalidateDestination(); return peerAuth.identity({ agent: "claude", accountFingerprint: readBridgeAccounts().claude.fingerprint, taskId: current.desktop.taskId, sessionId: current.sessionId, turnId: null, cwd: current.cwd }); },
+          transport: ({ marker, messageId }) => peer.send(session.socket, marker, { msgId: messageId, permissionMode: sender.mode, beforeSend: revalidateDestination }),
+        });
+        return { ...textResult(JSON.stringify({ status: "PENDING", message_id: issued.message_id })), structuredContent: { peerAuth: { status: "PENDING", message_id: issued.message_id }, request: issued } };
+      }
+
       const wait = waitSec ?? 180;
       const desktop = session.entrypoint === "claude-desktop";
       const text = desktop ? `${message}\n\n[Bridge response routing: reply with ordinary text in this conversation. The bridge reads the response associated with this message from the local transcript; no cross-session reply tool is needed.]` : message;
@@ -309,34 +372,7 @@ registerTool(
         ...(sender ? { permissionMode: sender.mode, replyThreadId: sender.threadId, senderReview: sender.review, senderApprovalPolicy: sender.approvalPolicy } : {}),
         ...(desktop ? { recipient: { permissionMode: session.desktop.permissionMode ?? null, permissionClass: session.desktop.permissionClass ?? null, inboundPolicy: session.inbound?.value ?? null } } : {}),
         ...(scopeBindings ? { scopeBindings } : {}),
-        beforeSend: () => {
-          runtime.assertCurrent();
-          if (desktopOnly) assertAccountIdentity(selectedAccounts);
-          const current = findClaudeSession(session.sessionId ?? String(session.pid), { desktopOnly });
-          const destinationUnchanged = desktopOnly
-            ? sameClaudeDesktopRecipient(session, current)
-            : Boolean(current && current.pid === session.pid && current.socket === session.socket);
-          if (!destinationUnchanged) {
-            throw new Error("The Claude destination changed while this message was queued. No message was sent; inspect the existing Desktop session.");
-          }
-          if (desktopOnly || expectedCwd !== undefined) assertClaudeSessionCwd(current, expectedCwd);
-          assertSessionRoot(current);
-          if (desktopOnly) {
-            assertClaudeSessionProcess(current);
-            const refreshed = withDesktopContext(current, readClaudeAccountContext());
-            assertDesktopTask(refreshed, selectedTaskId);
-            const active = assertSender(extra?._meta);
-            if (rootPolicy.enabled) {
-              rootPolicy.recheck(scopeBindings.sender, "Codex sender working directory");
-              rootPolicy.recheck(scopeBindings.recipient, "Claude recipient working directory");
-            }
-            if (active.threadId !== sender.threadId || active.turnId !== sender.turnId || active.cwd !== sender.cwd || active.mode !== sender.mode || active.approvalPolicy !== sender.approvalPolicy || JSON.stringify(active.review) !== JSON.stringify(sender.review)) {
-              throw preflightFailure("CODEX_SENDER_CONTEXT_CHANGED", "The sender's active turn or permissions changed while this message was queued.");
-            }
-            assertRecipientClass(refreshed, active);
-            assertAccountIdentity(selectedAccounts);
-          }
-        },
+        beforeSend: revalidateDestination,
         ...(desktop ? { transcriptSession: session } : {}),
       });
       const status = reply ? "reply_received" : delivery?.status ?? (wait === 0 ? "sent_unconfirmed" : "reply_timeout");
@@ -554,7 +590,7 @@ registerTool(
       ];
       const state = runtime.status();
       lines.push(`runtime pid:   ${state.pid}`, `loaded source: ${state.revision}`, `disk source:   ${state.diskRevision ?? "unreadable"}`, `runtime state: ${state.current ? "current" : `STALE - ${state.reason}; reconnect this MCP server in the existing task`}`);
-      return { ...textResult(lines.join("\n"), !state.current), structuredContent: { runtime: state, accounts: { claude: publicAccountState(accounts.claude), codex: publicAccountState(accounts.codex) }, replyForwarding: visibleForwarding, ...(sender ? { sender } : {}) } };
+      return { ...textResult(lines.join("\n"), !state.current), structuredContent: { runtime: state, accounts: { claude: publicAccountState(accounts.claude), codex: publicAccountState(accounts.codex) }, replyForwarding: visibleForwarding, ...(sender ? { sender } : {}), ...(peerAuth ? { peerAuth: peerAuth.status() } : {}) } };
     } catch (err) {
       return failure(err);
     }

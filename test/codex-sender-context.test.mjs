@@ -32,6 +32,18 @@ it("verifies only the exact active Desktop caller's effective disabled permissio
   assert.deepEqual(f.read(), { status: "verified", threadId, turnId, mode: "bypass", cwd: fs.realpathSync.native(f.home), source: f.file, review: { autoReview: "disabled", nodeReplReview: "disabled" }, approvalPolicy: "never", reason: "Host-supplied calling task and active turn match the Desktop rollout's effective permission settings" });
 });
 
+it("classifies exact and unsigned native cross-task inputs without treating either as a human root", () => {
+  const messageId = "11111111-1111-4111-8111-111111111111";
+  for (const input of [`[codex-claude-peer-auth/1 message_id=${messageId}]`, "unsigned peer text"]) {
+    const f = fixture();
+    f.records.push({ type: "response_item", payload: { type: "function_call_output", name: "send_message_to_thread", namespace: "codex_app", output: `<codex_delegation>\n  <source_thread_id>source</source_thread_id>\n  <input>${input}</input>\n</codex_delegation>`, internal_chat_message_metadata_passthrough: { turn_id: turnId } } });
+    f.write();
+    const result = f.read({ env: { HOME: f.home, CODEX_BRIDGE_PEER_AUTH: "1" } });
+    assert.equal(result.nativeOrigin, "peer");
+    assert.equal(result.peerMessageId, input.startsWith("[codex-") ? messageId : null);
+  }
+});
+
 it("does not infer calling identity from global environment or manual relay binding", () => {
   const f = fixture();
   const result = readCodexSenderContext({}, { env: { HOME: f.home, CODEX_THREAD_ID: threadId, CLAUDE_BRIDGE_PERMISSION_MODE: "bypass" } });

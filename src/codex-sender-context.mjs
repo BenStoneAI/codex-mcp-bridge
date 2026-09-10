@@ -77,6 +77,7 @@ function readState(file, maxBytes) {
     let session;
     let context;
     let lifecycle;
+    const peerInputs = [];
     for (const line of text.split("\n")) {
       if (!line) continue;
       const record = JSON.parse(line);
@@ -88,9 +89,21 @@ function readState(file, maxBytes) {
         context = record.payload;
       } else if (record.type === "event_msg" && LIFECYCLE.has(record.payload.type)) {
         lifecycle = record.payload;
+      } else if (record.type === "response_item" && record.payload.type === "function_call_output" && record.payload.name === "send_message_to_thread" && record.payload.namespace === "codex_app") {
+        peerInputs.push({ turnId: record.payload.internal_chat_message_metadata_passthrough?.turn_id ?? null, output: record.payload.output });
       }
     }
-    return { session, context, lifecycle };
+    let peerMessageId = null;
+    let peerInputSeen = false;
+    for (const item of peerInputs) {
+      if (item.turnId !== context?.turn_id || typeof item.output !== "string") continue;
+      peerInputSeen = true;
+      const match = item.output.match(/^<codex_delegation>\r?\n  <source_thread_id>[^<\r\n]+<\/source_thread_id>\r?\n  <input>\[codex-claude-peer-auth\/1 message_id=([0-9a-f-]{36})\]<\/input>\r?\n<\/codex_delegation>$/);
+      if (!match) continue;
+      if (peerMessageId && peerMessageId !== match[1]) throw new Error("The active Codex turn contains ambiguous authenticated peer markers");
+      peerMessageId = match[1];
+    }
+    return { session, context, lifecycle, peerMessageId, nativeOrigin: peerInputSeen ? "peer" : "human" };
   } finally {
     fs.closeSync(descriptor);
   }
@@ -133,14 +146,14 @@ export function readCodexSenderContext(meta, { env = process.env, maxRolloutByte
     const sessions = path.join(configuredHome, "sessions");
     const file = findRollout(sessions, identity.threadId);
     const state = readState(file, Math.min(MAX_ROLLOUT_BYTES, maxRolloutBytes));
-    const { session, context, lifecycle } = state;
+    const { session, context, lifecycle, peerMessageId, nativeOrigin } = state;
     if (session?.id !== identity.threadId || session.originator !== "Codex Desktop" || session.source !== "vscode") throw new Error("The caller rollout does not confirm a root Codex Desktop task");
     if (context?.turn_id !== identity.turnId || lifecycle?.turn_id !== identity.turnId || !STARTED.has(lifecycle?.type)) throw new Error("The calling turn is no longer the latest active Codex turn");
     if (typeof context.cwd !== "string" || !path.isAbsolute(context.cwd) || typeof session.cwd !== "string" || !path.isAbsolute(session.cwd)) throw new Error("The caller's workspace is missing or invalid");
     const cwd = fs.realpathSync.native(context.cwd);
     if (!fs.statSync(cwd).isDirectory() || path.relative(fs.realpathSync.native(session.cwd), cwd)) throw new Error("The caller's workspace changed from its Desktop session identity");
     const mode = permissionClass(context, metadata);
-    return { status: "verified", ...identity, mode, cwd, source: file, approvalPolicy: context.approval_policy, reason: "Host-supplied calling task and active turn match the Desktop rollout's effective permission settings" };
+    return { status: "verified", ...identity, mode, cwd, source: file, approvalPolicy: context.approval_policy, ...(env.CODEX_BRIDGE_PEER_AUTH === "1" ? { peerMessageId, nativeOrigin } : {}), reason: "Host-supplied calling task and active turn match the Desktop rollout's effective permission settings" };
   } catch (error) {
     return unavailable(error?.code ? `Caller evidence could not be read (${error.code}); no sender permission class was inferred` : error.message, identity);
   }

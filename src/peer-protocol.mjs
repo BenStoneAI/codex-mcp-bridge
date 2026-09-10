@@ -298,6 +298,36 @@ export function readTranscript(sessionId, cwd, limit = 10) {
   return { file, messages: messages.slice(-limit) };
 }
 
+export function readClaudePromptContext(sessionId, cwd, { maxBytes = 16 * 1024 * 1024 } = {}) {
+  const file = findTranscriptFile(sessionId, cwd);
+  const beforePath = fs.lstatSync(file);
+  if (!beforePath.isFile() || beforePath.isSymbolicLink() || beforePath.nlink !== 1 || beforePath.size < 1 || beforePath.size > maxBytes) throw new Error("Claude prompt transcript is not a bounded regular file");
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+  try {
+    const before = fs.fstatSync(fd);
+    if (before.dev !== beforePath.dev || before.ino !== beforePath.ino) throw new Error("Claude prompt transcript identity changed");
+    const data = Buffer.alloc(before.size);
+    let offset = 0;
+    while (offset < data.length) { const count = fs.readSync(fd, data, offset, data.length - offset, offset); if (!count) throw new Error("Claude prompt transcript changed while reading"); offset += count; }
+    const after = fs.fstatSync(fd); const afterPath = fs.lstatSync(file);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.dev !== afterPath.dev || before.ino !== afterPath.ino) throw new Error("Claude prompt transcript changed while reading");
+    const text = data.toString("utf8");
+    if (!text.endsWith("\n")) throw new Error("Claude prompt transcript has an incomplete record");
+    let latest = null;
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      const entry = JSON.parse(line);
+      if (entry?.message?.role !== "user" || entry.isMeta || entry.isSidechain || !["human", "peer"].includes(entry.origin?.kind)) continue;
+      const turnId = typeof entry.promptId === "string" && entry.promptId ? entry.promptId : entry.uuid;
+      if (typeof turnId !== "string" || !turnId) throw new Error("Claude prompt origin has no stable turn identity");
+      if (entry.origin.kind === "peer" && (typeof entry.origin.msg_id !== "string" || entry.origin.msg_id !== entry.uuid)) throw new Error("Claude peer prompt origin does not match its native message identity");
+      latest = { turnId, origin: entry.origin.kind, peerMessageId: entry.origin.kind === "peer" ? entry.origin.msg_id : null };
+    }
+    if (!latest) throw new Error("Claude prompt transcript has no current human or peer origin");
+    return latest;
+  } finally { fs.closeSync(fd); }
+}
+
 /**
  * Claude Code records an injected peer message in one of two shapes. An idle
  * recipient starts a new turn with a user entry whose uuid is the message id
@@ -724,7 +754,7 @@ export class PeerEndpoint {
     return frame.msg_id;
   }
 
-  async sendAndWait(targetSocket, text, { timeoutMs = 120000, priority = "next", transcriptSession, beforeSend, permissionMode = this.permissionMode, replyThreadId, senderReview, senderApprovalPolicy, recipient, accountContext, scopeBindings } = {}) {
+  async sendAndWait(targetSocket, text, { timeoutMs = 120000, priority = "next", transcriptSession, beforeSend, permissionMode = this.permissionMode, replyThreadId, senderReview, senderApprovalPolicy, recipient, accountContext, scopeBindings, messageId } = {}) {
     const previous = this.requestQueues.get(targetSocket) ?? Promise.resolve();
     const pending = previous.catch(() => {}).then(async () => {
       await beforeSend?.();
@@ -740,7 +770,7 @@ export class PeerEndpoint {
       const since = Date.now();
       const afterSequence = this.messageSequence;
       this.unconfirmedReplies.set(targetSocket, unconfirmed + 1);
-      let msgId = crypto.randomUUID();
+      let msgId = messageId ?? crypto.randomUUID();
       this.pendingMessages.set(msgId, { targetSocket, transcriptSession });
       this.sentMessages.set(msgId, { targetSocket, transcriptSession, sentAt: since, replyThreadId, permissionMode, senderApprovalPolicy, ...(senderReview ? { senderReview: { ...senderReview } } : {}), ...(recipient ? { recipient: { ...recipient } } : {}), ...(accountContext ? { accountContext: Object.freeze({ ...accountContext }) } : {}), ...(scopeBindings ? { scopeBindings: Object.freeze(structuredClone(scopeBindings)) } : {}) });
       if (transcriptSession && !this.responsePoll) {

@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { listClaudeSessions } from "./peer-protocol.mjs";
+import { listClaudeSessions, readClaudePromptContext } from "./peer-protocol.mjs";
 import { readClaudeDesktopContext } from "./claude-desktop-context.mjs";
 
 const execute = promisify(execFile);
@@ -148,7 +148,7 @@ function senderFailureCode(error) {
   return "UNAVAILABLE";
 }
 
-export async function readClaudeSenderContext({ account, parentPid = process.ppid, readAncestry = readProcessAncestry, listSessions = listClaudeSessions, readContext = readClaudeDesktopContext } = {}) {
+export async function readClaudeSenderContext({ account, parentPid = process.ppid, readAncestry = readProcessAncestry, listSessions = listClaudeSessions, readContext = readClaudeDesktopContext, readPrompt = readClaudePromptContext, env = process.env } = {}) {
   if (account?.status !== "verified" || !account.fingerprint) return senderResult("unavailable", "The calling Claude account is not verified.");
   let stage = "session_registry";
   try {
@@ -175,9 +175,10 @@ export async function readClaudeSenderContext({ account, parentPid = process.ppi
     stage = "task_metadata";
     const context = readContext(session, { account });
     if (context.status !== "matched") return senderResult("unavailable", "The calling Claude Code session is not confirmed in the currently signed-in account.");
+    const prompt = env.CODEX_BRIDGE_PEER_AUTH === "1" ? readPrompt(session.sessionId, context.cwd) : { turnId: null, peerMessageId: null };
     return senderResult("verified", "The calling MCP process belongs to a live Claude Desktop Code session in the selected account.", {
       pid: session.pid, sessionId: session.sessionId, taskId: context.taskId, cwd: context.cwd,
-      processStart: process.processStart, accountFingerprint: account.fingerprint,
+      processStart: process.processStart, accountFingerprint: account.fingerprint, ...(env.CODEX_BRIDGE_PEER_AUTH === "1" ? { turnId: prompt.turnId, peerMessageId: prompt.peerMessageId, nativeOrigin: prompt.origin } : {}),
       lineage: ancestry.map((entry) => ({ ...entry })),
     });
   } catch (error) {
@@ -197,7 +198,8 @@ export function requireClaudeSenderContext(sender) {
 
 export async function assertClaudeSenderContext(expected, options) {
   const current = requireClaudeSenderContext(await readClaudeSenderContext(options));
-  if (["pid", "sessionId", "taskId", "cwd", "processStart", "accountFingerprint"].some((field) => current[field] !== expected?.[field])) {
+  const fields = ["pid", "sessionId", "taskId", "cwd", "processStart", "accountFingerprint", ...(Object.hasOwn(expected ?? {}, "turnId") ? ["turnId", "peerMessageId", "nativeOrigin"] : [])];
+  if (fields.some((field) => current[field] !== expected?.[field])) {
     const error = new Error("The calling Claude Desktop session or account changed while this operation was pending.");
     error.code = "CLAUDE_SENDER_CONTEXT_CHANGED";
     throw error;
