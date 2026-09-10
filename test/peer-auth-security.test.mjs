@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { buildPeerEnvelope, capabilityAllows, signPeerEnvelope, validatePeerEnvelope, verifyPeerEnvelopeSignature } from "../src/peer-auth-canonical.mjs";
+import { inspectCodexNativePeerTurn } from "../src/codex-native-response.mjs";
 import { PeerAuthKeyStore } from "../src/peer-auth-keystore-win32.mjs";
 import { PeerAuthStore } from "../src/peer-auth-store.mjs";
 import { inspectCodexTask, provisionPeerAuth } from "../src/peer-auth-setup.mjs";
@@ -77,6 +78,44 @@ describe("peer authentication native setup preflight", () => {
     const accounts = { claude: { status: "verified", fingerprint: "a" }, codex: { status: "verified", fingerprint: "b" } };
     await assert.rejects(provisionPeerAuth({ root: setupRoot, cwd, projectId: crypto.randomUUID(), claudeTaskId: `local_${crypto.randomUUID()}`, claudeSessionId: "session", codexTaskId: crypto.randomUUID(), accounts, sessions: [] }), /missing or ambiguous/);
     assert.equal(fs.existsSync(setupRoot), false);
+  });
+});
+
+describe("peer authentication Codex issuer lifecycle", () => {
+  it("accepts one exact active or completed native issuer turn and rejects malformed lifecycle evidence", () => {
+    const home = root(); const cwd = path.join(home, "work"); fs.mkdirSync(cwd);
+    const directory = path.join(home, ".codex", "sessions", "2026", "09", "09"); fs.mkdirSync(directory, { recursive: true });
+    const threadId = crypto.randomUUID(); const turnId = crypto.randomUUID(); const otherTurn = crypto.randomUUID();
+    const file = path.join(directory, `rollout-auth-${threadId}.jsonl`);
+    const session = { type: "session_meta", payload: { id: threadId, originator: "Codex Desktop", source: "vscode", cwd } };
+    const start = { type: "event_msg", payload: { type: "task_started", turn_id: turnId } };
+    const context = { type: "turn_context", payload: { turn_id: turnId, cwd } };
+    const complete = { type: "event_msg", payload: { type: "task_complete", turn_id: turnId } };
+    const write = (records, first = session) => fs.writeFileSync(file, `${[first, ...records].map(JSON.stringify).join("\n")}\n`);
+    const inspect = (overrides = {}) => inspectCodexNativePeerTurn({ threadId, turnId, expectedCwd: cwd, ...overrides }, { env: { HOME: home, USERPROFILE: home, CODEX_HOME: path.join(home, ".codex") } });
+
+    write([start, context]);
+    assert.deepEqual(inspect(), { status: "active", threadId, turnId, source: "codex_desktop_rollout" });
+    write([start, context, complete]);
+    assert.deepEqual(inspect(), { status: "completed", threadId, turnId, source: "codex_desktop_rollout" });
+
+    const invalid = [
+      ["aborted", [start, context, { type: "event_msg", payload: { type: "turn_aborted", turn_id: turnId } }]],
+      ["failed", [start, context, { type: "event_msg", payload: { type: "turn_failed", turn_id: turnId } }]],
+      ["duplicate start", [start, start, context]],
+      ["duplicate context", [start, context, context]],
+      ["duplicate completion", [start, context, complete, complete]],
+      ["out of order", [context, start]],
+      ["missing turn", [{ type: "event_msg", payload: { type: "task_started", turn_id: otherTurn } }, { type: "turn_context", payload: { turn_id: otherTurn, cwd } }]],
+      ["wrong cwd", [start, { ...context, payload: { ...context.payload, cwd: home } }]],
+      ["superseded active turn", [start, context, { type: "event_msg", payload: { type: "task_started", turn_id: otherTurn } }]],
+      ["contradictory turn", [{ ...start, payload: { ...start.payload, root_turn_id: otherTurn } }, context]],
+    ];
+    for (const [name, records] of invalid) { write(records); assert.equal(inspect().status, "unavailable", name); }
+    write([start, context], { ...session, payload: { ...session.payload, source: "cli" } });
+    assert.equal(inspect().status, "unavailable", "wrong source");
+    write([start, context], { ...session, payload: { ...session.payload, id: crypto.randomUUID() } });
+    assert.equal(inspect().status, "unavailable", "wrong task");
   });
 });
 

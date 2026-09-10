@@ -306,6 +306,40 @@ export function inspectCodexNativeTurn({ threadId, turnId, expectedCwd }, { env 
   }
 }
 
+/**
+ * Confirms only the native identity and lifecycle of a signed peer issuer.
+ * Unlike inspectCodexNativeTurn, an active turn is valid here and assistant
+ * response content is neither required nor returned.
+ */
+export function inspectCodexNativePeerTurn({ threadId, turnId, expectedCwd }, { env = process.env, maxRolloutBytes = MAX_ROLLOUT_BYTES } = {}) {
+  try {
+    if (!UUID.test(threadId) || !UUID.test(turnId)) throw new Error("The native peer issuer identity is invalid");
+    const cwd = canonicalDirectory(expectedCwd, "The selected native task workspace");
+    const found = findRollout(threadId, env);
+    const snapshot = readStable(found, maxRolloutBytes);
+    const records = parseRecords(snapshot.data);
+    validateSession(records, threadId, cwd);
+    const turns = records.filter((entry) => recordBelongsToTurn(entry, threadId, turnId));
+    const starts = turns.filter(({ record }) => record.type === "event_msg" && STARTED.has(record.payload.type));
+    const contexts = turns.filter(({ record }) => record.type === "turn_context");
+    const completions = turns.filter(({ record }) => record.type === "event_msg" && COMPLETED.has(record.payload.type));
+    const failures = turns.filter(({ record }) => record.type === "event_msg" &&
+      (FAILED.has(record.payload.type) || record.payload.error || ["failed", "aborted", "interrupted"].includes(record.payload.status)));
+    if (failures.length || starts.length !== 1 || contexts.length !== 1 || completions.length > 1 ||
+        canonicalDirectory(contexts[0].record.payload.cwd, "The peer issuer turn workspace") !== cwd ||
+        starts[0].start >= contexts[0].start || (completions.length && contexts[0].start >= completions[0].start)) {
+      throw new Error("The native peer issuer lifecycle is missing, ambiguous, failed, or out of order");
+    }
+    if (!completions.length) {
+      const laterStart = records.some(({ record, start }) => start > contexts[0].start && record.type === "event_msg" && STARTED.has(record.payload.type));
+      if (laterStart) throw new Error("The native peer issuer turn is no longer active");
+    }
+    return { status: completions.length ? "completed" : "active", threadId, turnId, source: "codex_desktop_rollout" };
+  } catch (error) {
+    return { ...unavailable(error), threadId, turnId, source: "codex_desktop_rollout" };
+  }
+}
+
 export function readCodexNativeTurnResponse({ threadId, turnId, previousTurnId, expectedCwd, executorThreadId, prompt, watermark }, { env = process.env, maxRolloutBytes = MAX_ROLLOUT_BYTES } = {}) {
   try {
     if (!UUID.test(threadId) || !UUID.test(turnId) || !UUID.test(executorThreadId)) throw new Error("The native response identity is invalid");

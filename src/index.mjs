@@ -33,6 +33,7 @@ import { assertClaudeSenderContext, readClaudeSenderContext, requireClaudeSender
 import { createPeerAuthRuntime } from "./peer-auth-runtime.mjs";
 import { peerAuthFailure, registerPeerAuthTools } from "./peer-auth-mcp.mjs";
 import { assertNativeCodexPeer } from "./peer-auth-native.mjs";
+import { inspectCodexNativePeerTurn } from "./codex-native-response.mjs";
 
 exitForVersionRequest(import.meta.url);
 
@@ -409,7 +410,7 @@ async function resolveCodexPeerIdentity(signed, _extra, envelope = null) {
   await assertDesktopOperation(context);
   const inspected = await desktopTasks.inspect(signed.task_id, scope?.canonical_cwd, { deadline: context.deadline });
   if (signed.turn_id) {
-    const observed = await desktopTasks.inspectNativeTurn(signed.task_id, signed.turn_id, scope?.canonical_cwd, { deadline: context.deadline });
+    const observed = inspectCodexNativePeerTurn({ threadId: signed.task_id, turnId: signed.turn_id, expectedCwd: scope?.canonical_cwd });
     if (observed.status === "unavailable") throw new Error("The signed Codex turn is not available for native revalidation");
   }
   const accounts = readBridgeAccounts();
