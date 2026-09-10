@@ -34,6 +34,31 @@ function tools(runtime, currentIdentity, resolvePeerIdentity) {
 }
 
 describe("peer authentication MCP handlers", () => {
+  for (const from of ["claude", "codex"]) it(`preserves ${from} refusal codes and uncertain IDs without exposing error internals`, async () => {
+    const { peerAuthFailure } = await import("../src/peer-auth-mcp.mjs");
+    const f = fixture(); const sender = f[from]; const recipient = f[from === "claude" ? "codex" : "claude"];
+    let dispatches = 0;
+    const send = (requestedCapability, transport) => f.services[from].issueRequest({ text: "harmless", sender, recipient, requestedCapability, revalidateSender: async () => sender, revalidateRecipient: async () => recipient, transport });
+    try {
+      let denied;
+      try { await send("edit_project", async () => { dispatches++; }); } catch (error) { denied = error; }
+      const refusal = peerAuthFailure(denied);
+      assert.equal(refusal.isError, true); assert.equal(refusal.structuredContent.peerAuth.status, "CAPABILITY_DENIED");
+      assert.equal(dispatches, 0); assert.equal(f.store.db.prepare("SELECT COUNT(*) n FROM messages").get().n, 0);
+      let uncertain;
+      try { await send("read_only", async () => { dispatches++; throw new Error("PRIVATE_TRANSPORT_DETAILS"); }); } catch (error) { uncertain = error; }
+      const result = peerAuthFailure(uncertain); const value = result.structuredContent.peerAuth;
+      assert.equal(value.status, "DELIVERY_UNKNOWN"); assert.equal(value.message_id, uncertain.messageId);
+      assert.equal(f.store.get(value.message_id).state, "delivery_unknown"); assert.equal(dispatches, 1);
+      assert.deepEqual(JSON.parse(result.content[0].text), value);
+      assert.doesNotMatch(JSON.stringify(result), /PRIVATE_TRANSPORT_DETAILS|cause|stack/);
+      const read = await f.services[from].readPeerReply({ messageId: value.message_id, origin: sender, revalidateOrigin: async () => sender, resolveReplySender: async () => recipient });
+      assert.equal(read.status, "DELIVERY_UNKNOWN"); assert.equal(dispatches, 1);
+      assert.equal(peerAuthFailure({ code: "VERIFIED", messageId: "private-invalid-id" }).structuredContent.peerAuth.status, "UNVERIFIED");
+      assert.equal(peerAuthFailure({ code: "VERIFIED", messageId: "private-invalid-id" }).structuredContent.peerAuth.message_id, null);
+    } finally { f.store.close(); }
+  });
+
   for (const [from, to] of [["claude", "codex"], ["codex", "claude"]]) it(`verifies and closes one exact ${from} to ${to} signed exchange`, async () => {
     const f = fixture();
     const sender = f[from]; const recipient = f[to];

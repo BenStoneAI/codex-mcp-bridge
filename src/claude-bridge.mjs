@@ -21,7 +21,7 @@ import { assertAccountIdentity, bindUnsolicitedClaudeMessageAccount, publicAccou
 import { resolveClaudeDesktopSession, sameClaudeDesktopRecipient } from "./claude-session-router.mjs";
 import { createHardenedRootPolicy } from "./hardened-root-policy.mjs";
 import { createPeerAuthRuntime } from "./peer-auth-runtime.mjs";
-import { registerPeerAuthTools } from "./peer-auth-mcp.mjs";
+import { peerAuthFailure, registerPeerAuthTools } from "./peer-auth-mcp.mjs";
 import { assertNativeCodexPeer } from "./peer-auth-native.mjs";
 
 exitForVersionRequest(import.meta.url);
@@ -121,7 +121,7 @@ const textResult = (text, isError = false) => ({
   ...(isError ? { isError: true } : {}),
 });
 
-const failure = (err) => ({
+const failure = (err) => peerAuth ? peerAuthFailure(err) : ({
   ...textResult(`Claude bridge error: ${err?.message ?? String(err)}${err?.msgId ? `\nMessage id: ${err.msgId}; inspect read_claude_delivery before any resend.` : ""}`, true),
   ...(err?.msgId ? { structuredContent: { receipt: readReceipt(err.msgId) } }
     : err?.preflight ? { structuredContent: { preflight: err.preflight } } : {}),

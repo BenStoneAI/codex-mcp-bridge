@@ -31,7 +31,7 @@ import { assertRoutingReload, clientReloadReason, createReloadControl } from "./
 import { accountIdentity, assertAccountIdentity, publicAccountState, readBridgeAccounts, requireBridgeAccounts } from "./bridge-account-context.mjs";
 import { assertClaudeSenderContext, readClaudeSenderContext, requireClaudeSenderContext } from "./claude-sender-context.mjs";
 import { createPeerAuthRuntime } from "./peer-auth-runtime.mjs";
-import { registerPeerAuthTools } from "./peer-auth-mcp.mjs";
+import { peerAuthFailure, registerPeerAuthTools } from "./peer-auth-mcp.mjs";
 import { assertNativeCodexPeer } from "./peer-auth-native.mjs";
 
 exitForVersionRequest(import.meta.url);
@@ -118,7 +118,7 @@ const textResult = (text, isError = false) => ({
   ...(isError ? { isError: true } : {}),
 });
 
-const failure = (err) => textResult(`Codex bridge error: ${err?.message ?? String(err)}`, true);
+const failure = (err) => peerAuth ? peerAuthFailure(err) : textResult(`Codex bridge error: ${err?.message ?? String(err)}`, true);
 
 /**
  * Decides whether this bridge may act on a thread, before anything acts on it.

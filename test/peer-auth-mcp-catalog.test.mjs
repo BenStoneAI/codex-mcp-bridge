@@ -36,10 +36,10 @@ describe("authenticated peer MCP catalogs", () => {
       assert.ok(send.inputSchema.properties.requested_capability); assert.ok(send.inputSchema.properties.parent_message_id);
       if (entry === "index.mjs") {
         const blockedSend = await client.callTool({ name: "send_to_codex_thread", arguments: { threadId: crypto.randomUUID(), prompt: "raw" } });
-        assert.equal(blockedSend.isError, true); assert.match(blockedSend.content[0].text, /Authenticated peer mode/);
+        assert.equal(blockedSend.isError, true); assert.deepEqual(blockedSend.structuredContent.peerAuth, { status: "UNVERIFIED", message_id: null, reason_code: "UNVERIFIED" });
         for (const name of ["delegate_to_codex", "start_codex_thread"]) {
           const blocked = await client.callTool({ name, arguments: name === "delegate_to_codex" ? { cwd, prompt: "raw" } : { cwd, prompt: "raw" } });
-          assert.equal(blocked.isError, true); assert.match(blocked.content[0].text, /Authenticated peer mode/);
+          assert.equal(blocked.isError, true); assert.deepEqual(blocked.structuredContent.peerAuth, { status: "UNVERIFIED", message_id: null, reason_code: "UNVERIFIED" });
         }
       }
     } finally { await client.close(); }
