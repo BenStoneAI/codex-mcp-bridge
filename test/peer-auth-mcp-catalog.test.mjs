@@ -15,8 +15,9 @@ const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "peer-auth-catalog-"));
 const authRoot = path.join(sandbox, "auth");
 const cwd = fs.realpathSync.native(sandbox); const stat = fs.statSync(cwd, { bigint: true }); const cwdIdentity = `${stat.dev}:${stat.ino}`;
 
-describe("authenticated peer MCP catalogs", { skip: process.platform !== "win32" }, () => {
+describe("authenticated peer MCP catalogs", () => {
   before(() => {
+    assert.equal(process.platform, "win32", "Required DPAPI acceptance must run on Windows");
     const keys = new PeerAuthKeyStore({ root: authRoot }); keys.setup();
     const store = new PeerAuthStore({ root: authRoot, validateStorage: (paths) => keys.validatePaths(paths), protectStorage: (paths) => keys.protectPaths(paths) });
     for (const [agent, taskId, sessionId] of [["claude", `local_${crypto.randomUUID()}`, "session"], ["codex", crypto.randomUUID(), ""]]) store.provisionGrant({ agent, accountFingerprint: `${agent}-account`, taskId, sessionId, cwd, cwdIdentity, projectId: crypto.randomUUID(), capabilityCeiling: "review_only" });

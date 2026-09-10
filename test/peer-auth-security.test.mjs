@@ -52,7 +52,7 @@ describe("peer authentication native setup preflight", () => {
   it("rejects a preexisting junction before changing any ACL or writing a key", (t) => {
     const base = root(); const target = path.join(base, "target"); const junction = path.join(base, "auth");
     fs.mkdirSync(target);
-    try { fs.symlinkSync(target, junction, "junction"); } catch (error) { t.skip(`junction unavailable: ${error.code ?? error.message}`); return; }
+    fs.symlinkSync(target, junction, "junction");
     let aclMutations = 0;
     const keys = new PeerAuthKeyStore({ root: junction, platform: "win32", protectAcl: () => { aclMutations += 1; }, validateAcl: () => {} });
     assert.throws(() => keys.setup(), /reparse point/);
