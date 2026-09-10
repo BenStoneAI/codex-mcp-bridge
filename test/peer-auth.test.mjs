@@ -48,6 +48,27 @@ function rewriteEnvelope(f, messageId, mutate, { resignAgent } = {}) {
 }
 
 describe("authenticated peer messages", () => {
+  it("accepts only a child that reverses its immediate parent route", async (t) => {
+    for (const direction of ["claude", "codex"]) for (const changed of ["neither", "sender", "recipient"]) {
+      const f = fixture(t);
+      const from = f[direction]; const to = direction === "claude" ? f.codex : f.claude;
+      const parent = await f.issue({ from, to });
+      assert.equal((await f.verify(parent.message_id, { sender: from, recipient: to })).status, "VERIFIED");
+      const child = await f.issue({ from: to, to: from, parentMessageId: parent.message_id });
+      let sender = to; let recipient = { ...from, turn_id: "child-receiver-turn" };
+      if (changed !== "neither") {
+        const original = changed === "sender" ? sender : recipient;
+        const other = { ...original, task_id: `${original.task_id}-other`, ...(original.session_id ? { session_id: `${original.session_id}-other` } : {}) };
+        f.store.provisionGrant({ agent: other.agent, accountFingerprint: other.account_fingerprint, taskId: other.task_id, sessionId: other.session_id, cwd: other.canonical_cwd, cwdIdentity: other.cwd_identity, projectId: other.project_id, capabilityCeiling: "review_only" });
+        rewriteEnvelope(f, child.message_id, (envelope) => { envelope[changed].task_id = other.task_id; envelope[changed].session_id = other.session_id; }, { resignAgent: to.agent });
+        if (changed === "sender") sender = other; else recipient = other;
+      }
+      const result = await f.verify(child.message_id, { sender, recipient });
+      assert.equal(result.status, changed === "neither" ? "VERIFIED" : "INVALID_PARENT", `${direction} child changed ${changed}`);
+      if (changed !== "neither") assert.equal(f.store.get(child.message_id).consumedAt, null);
+    }
+  });
+
   for (const direction of ["claude_to_codex", "codex_to_claude"]) {
     it(`accepts a valid signed ${direction} request`, async (t) => {
       const f = fixture(t);

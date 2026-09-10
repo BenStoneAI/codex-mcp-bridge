@@ -57,7 +57,7 @@ function findRollout(sessions, threadId) {
   return matches[0];
 }
 
-function readState(file, maxBytes) {
+function readState(file, maxBytes, authenticated = false) {
   const descriptor = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
   try {
     const before = fs.fstatSync(descriptor);
@@ -95,14 +95,16 @@ function readState(file, maxBytes) {
     }
     let peerMessageId = null;
     let peerInputSeen = false;
+    let unsignedPeerInputSeen = false;
     for (const item of peerInputs) {
       if (item.turnId !== context?.turn_id || typeof item.output !== "string") continue;
       peerInputSeen = true;
       const match = item.output.match(/^<codex_delegation>\r?\n  <source_thread_id>[^<\r\n]+<\/source_thread_id>\r?\n  <input>\[codex-claude-peer-auth\/1 message_id=([0-9a-f-]{36})\]<\/input>\r?\n<\/codex_delegation>$/);
-      if (!match) continue;
+      if (!match) { unsignedPeerInputSeen = true; continue; }
       if (peerMessageId && peerMessageId !== match[1]) throw new Error("The active Codex turn contains ambiguous authenticated peer markers");
       peerMessageId = match[1];
     }
+    if (authenticated && peerMessageId && unsignedPeerInputSeen) throw new Error("The active Codex turn mixes authenticated and unsigned peer inputs");
     return { session, context, lifecycle, peerMessageId, nativeOrigin: peerInputSeen ? "peer" : "human" };
   } finally {
     fs.closeSync(descriptor);
@@ -145,7 +147,7 @@ export function readCodexSenderContext(meta, { env = process.env, maxRolloutByte
     if (!path.isAbsolute(configuredHome)) throw new Error("The configured Codex home must be absolute");
     const sessions = path.join(configuredHome, "sessions");
     const file = findRollout(sessions, identity.threadId);
-    const state = readState(file, Math.min(MAX_ROLLOUT_BYTES, maxRolloutBytes));
+    const state = readState(file, Math.min(MAX_ROLLOUT_BYTES, maxRolloutBytes), env.CODEX_BRIDGE_PEER_AUTH === "1");
     const { session, context, lifecycle, peerMessageId, nativeOrigin } = state;
     if (session?.id !== identity.threadId || session.originator !== "Codex Desktop" || session.source !== "vscode") throw new Error("The caller rollout does not confirm a root Codex Desktop task");
     if (context?.turn_id !== identity.turnId || lifecycle?.turn_id !== identity.turnId || !STARTED.has(lifecycle?.type)) throw new Error("The calling turn is no longer the latest active Codex turn");

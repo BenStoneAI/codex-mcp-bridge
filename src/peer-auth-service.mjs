@@ -197,6 +197,9 @@ export class PeerAuthService {
       if (!capabilityAllows(grant.capability_ceiling, envelope.requested_capability) || !capabilityAllows(senderGrant.capability_ceiling, envelope.requested_capability)) throw authError("CAPABILITY_DENIED", "Peer capability exceeds a current endpoint grant");
       if (envelope.parent_message_id) {
         const parentEnvelope = this.#assertVerifiedParentChain(envelope.parent_message_id, now);
+        const childSenderMismatch = exactIdentity(scoped(envelope.sender, envelope), scoped(parentEnvelope.recipient, parentEnvelope), { includeTurn: false });
+        const childRecipientMismatch = exactIdentity(scoped(envelope.recipient, envelope), scoped(parentEnvelope.sender, parentEnvelope), { includeTurn: false });
+        if (childSenderMismatch || childRecipientMismatch) throw authError("INVALID_PARENT", "Peer child does not reverse its immediate parent route");
         if (!capabilityAllows(parentEnvelope.requested_capability, envelope.requested_capability) || envelope.originating_user_task_id !== parentEnvelope.originating_user_task_id || JSON.stringify(envelope.scope) !== JSON.stringify(parentEnvelope.scope) || JSON.stringify(envelope.allowed_roots) !== JSON.stringify(parentEnvelope.allowed_roots)) throw authError("CAPABILITY_DENIED", "Peer child exceeds or changes its parent authority");
       }
       const consumed = this.store.consume(messageId);

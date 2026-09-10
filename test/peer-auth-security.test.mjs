@@ -9,6 +9,7 @@ import { PeerAuthKeyStore } from "../src/peer-auth-keystore-win32.mjs";
 import { PeerAuthStore } from "../src/peer-auth-store.mjs";
 import { inspectCodexTask, provisionPeerAuth } from "../src/peer-auth-setup.mjs";
 import { readClaudePromptContext } from "../src/peer-protocol.mjs";
+import { readCodexSenderContext } from "../src/codex-sender-context.mjs";
 
 const roots = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -97,4 +98,23 @@ describe("peer authentication Claude prompt origin", () => {
       assert.deepEqual(readClaudePromptContext(sessionId, cwd), { turnId: "human-turn", origin: "human", peerMessageId: null });
     } finally { if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; }
   });
+});
+
+it("rejects mixed native peer ancestry while preserving signed-only and unsigned-only classification", () => {
+  for (const kinds of [["signed"], ["unsigned"], ["signed", "unsigned"], ["unsigned", "signed"]]) {
+    const home = root(); const threadId = crypto.randomUUID(); const turnId = crypto.randomUUID(); const messageId = crypto.randomUUID();
+    const directory = path.join(home, "sessions", "2026", "09", "09"); fs.mkdirSync(directory, { recursive: true });
+    const records = [
+      { type: "session_meta", payload: { id: threadId, originator: "Codex Desktop", source: "vscode", cwd: home } },
+      { type: "event_msg", payload: { type: "task_started", turn_id: turnId } },
+      { type: "turn_context", payload: { turn_id: turnId, cwd: home, approval_policy: "never", approvals_reviewer: "user", permission_profile: { type: "disabled" }, sandbox_policy: { type: "danger-full-access" } } },
+      ...kinds.map((kind) => ({ type: "response_item", payload: { type: "function_call_output", name: "send_message_to_thread", namespace: "codex_app", output: `<codex_delegation>\n  <source_thread_id>source</source_thread_id>\n  <input>${kind === "signed" ? `[codex-claude-peer-auth/1 message_id=${messageId}]` : "unsigned peer text"}</input>\n</codex_delegation>`, internal_chat_message_metadata_passthrough: { turn_id: turnId } } })),
+    ];
+    fs.writeFileSync(path.join(directory, `rollout-security-${threadId}.jsonl`), `${records.map(JSON.stringify).join("\n")}\n`);
+    const metadata = { "x-codex-turn-metadata": { thread_id: threadId, turn_id: turnId, thread_source: "user", auto_review_enabled: false, node_repl_auto_review_required: false } };
+    const result = readCodexSenderContext(metadata, { env: { CODEX_HOME: home, CODEX_BRIDGE_PEER_AUTH: "1" } });
+    assert.equal(result.status, kinds.length > 1 ? "unavailable" : "verified", kinds.join("+"));
+    if (kinds.length === 1) { assert.equal(result.nativeOrigin, "peer"); assert.equal(result.peerMessageId, kinds[0] === "signed" ? messageId : null); }
+    assert.equal(readCodexSenderContext(metadata, { env: { CODEX_HOME: home } }).status, "verified", "Authentication opt-out retains the raw caller contract");
+  }
 });
