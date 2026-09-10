@@ -81,21 +81,50 @@ describe("peer authentication native setup preflight", () => {
 });
 
 describe("peer authentication Claude prompt origin", () => {
-  it("distinguishes a human root from an exact peer marker and ignores tool-result users", () => {
+  it("accepts the native meta peer shape without allowing unsupported peer records to fall back to a human root", () => {
     const home = root(); const previousHome = process.env.HOME; process.env.HOME = home;
     try {
       const cwd = path.join(home, "work"); fs.mkdirSync(cwd);
       const directory = path.join(home, ".claude", "projects", "fixture"); fs.mkdirSync(directory, { recursive: true });
       const sessionId = "session"; const file = path.join(directory, `${sessionId}.jsonl`); const messageId = crypto.randomUUID();
+      const human = { uuid: "human", promptId: "human-turn", origin: { kind: "human" }, message: { role: "user", content: "root" } };
+      const peer = {
+        type: "user", isMeta: true, isSidechain: false, uuid: messageId, promptId: "peer-turn", entrypoint: "claude-desktop", cwd, sessionId,
+        origin: { kind: "peer", from: "uds:test", msg_id: messageId, fromMode: "bypass", body: "opaque" },
+        message: { role: "user", content: `[codex-claude-peer-auth/1 message_id=${messageId}]` },
+      };
       const rows = [
-        { uuid: "human", promptId: "human-turn", origin: { kind: "human" }, message: { role: "user", content: "root" } },
-        { uuid: messageId, promptId: "peer-turn", origin: { kind: "peer", msg_id: messageId, from: "uds:test" }, message: { role: "user", content: `[codex-claude-peer-auth/1 message_id=${messageId}]` } },
+        human,
+        peer,
         { uuid: "tool", promptId: "peer-turn", message: { role: "user", content: [{ type: "tool_result", content: "ok" }] } },
       ];
       fs.writeFileSync(file, `${rows.map(JSON.stringify).join("\n")}\n`);
       assert.deepEqual(readClaudePromptContext(sessionId, cwd), { turnId: "peer-turn", origin: "peer", peerMessageId: messageId });
-      rows.splice(1); fs.writeFileSync(file, `${rows.map(JSON.stringify).join("\n")}\n`);
+
+      fs.writeFileSync(file, `${[human, { ...peer, message: { role: "user", content: "unsigned opaque peer payload" } }].map(JSON.stringify).join("\n")}\n`);
+      assert.deepEqual(readClaudePromptContext(sessionId, cwd), { turnId: "peer-turn", origin: "peer", peerMessageId: messageId });
+
+      fs.writeFileSync(file, `${[human, { ...peer, uuid: crypto.randomUUID() }].map(JSON.stringify).join("\n")}\n`);
+      assert.throws(() => readClaudePromptContext(sessionId, cwd), /does not match/);
+
+      const ordinaryMeta = { uuid: "meta", promptId: "meta-turn", isMeta: true, message: { role: "user", content: "ordinary metadata" } };
+      fs.writeFileSync(file, `${[human, ordinaryMeta].map(JSON.stringify).join("\n")}\n`);
       assert.deepEqual(readClaudePromptContext(sessionId, cwd), { turnId: "human-turn", origin: "human", peerMessageId: null });
+
+      const queuedPeer = { uuid: "queue", type: "attachment", attachment: { type: "queued_command", source_uuid: "unrelated", origin: { kind: "peer", msg_id: messageId, fromMode: "bypass" }, isMeta: true } };
+      fs.writeFileSync(file, `${[human, queuedPeer].map(JSON.stringify).join("\n")}\n`);
+      assert.throws(() => readClaudePromptContext(sessionId, cwd), /queued peer prompt/i);
+
+      const laterHuman = { uuid: "later", promptId: "later-turn", origin: { kind: "human" }, message: { role: "user", content: "next root" } };
+      fs.writeFileSync(file, `${[human, ordinaryMeta, laterHuman].map(JSON.stringify).join("\n")}\n`);
+      assert.deepEqual(readClaudePromptContext(sessionId, cwd), { turnId: "later-turn", origin: "human", peerMessageId: null });
+
+      fs.writeFileSync(file, `${[human, queuedPeer, laterHuman].map(JSON.stringify).join("\n")}\n`);
+      assert.deepEqual(readClaudePromptContext(sessionId, cwd), { turnId: "later-turn", origin: "human", peerMessageId: null });
+      fs.writeFileSync(file, `${[human, queuedPeer, peer].map(JSON.stringify).join("\n")}\n`);
+      assert.deepEqual(readClaudePromptContext(sessionId, cwd), { turnId: "peer-turn", origin: "peer", peerMessageId: messageId });
+      fs.writeFileSync(file, `${[human, { ...peer, uuid: crypto.randomUUID() }, laterHuman].map(JSON.stringify).join("\n")}\n`);
+      assert.deepEqual(readClaudePromptContext(sessionId, cwd), { turnId: "later-turn", origin: "human", peerMessageId: null });
     } finally { if (previousHome === undefined) delete process.env.HOME; else process.env.HOME = previousHome; }
   });
 });

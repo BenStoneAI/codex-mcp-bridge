@@ -317,13 +317,20 @@ export function readClaudePromptContext(sessionId, cwd, { maxBytes = 16 * 1024 *
     for (const line of text.split("\n")) {
       if (!line) continue;
       const entry = JSON.parse(line);
-      if (entry?.message?.role !== "user" || entry.isMeta || entry.isSidechain || !["human", "peer"].includes(entry.origin?.kind)) continue;
+      if (entry?.isSidechain) continue;
+      const queued = entry?.type === "attachment" && entry.attachment?.type === "queued_command" ? entry.attachment : null;
+      if (queued?.origin?.kind === "peer") { latest = { error: "Claude queued peer prompt cannot be bound to one native prompt turn" }; continue; }
+      if (entry?.message?.role !== "user") continue;
+      const content = entry.message.content;
+      if (Array.isArray(content) && content.length > 0 && content.every((part) => part?.type === "tool_result")) continue;
+      if (entry.origin?.kind !== "peer" && (entry.isMeta || entry.origin?.kind !== "human")) continue;
       const turnId = typeof entry.promptId === "string" && entry.promptId ? entry.promptId : entry.uuid;
-      if (typeof turnId !== "string" || !turnId) throw new Error("Claude prompt origin has no stable turn identity");
-      if (entry.origin.kind === "peer" && (typeof entry.origin.msg_id !== "string" || entry.origin.msg_id !== entry.uuid)) throw new Error("Claude peer prompt origin does not match its native message identity");
+      if (typeof turnId !== "string" || !turnId) { latest = { error: "Claude prompt origin has no stable turn identity" }; continue; }
+      if (entry.origin.kind === "peer" && (typeof entry.origin.msg_id !== "string" || entry.origin.msg_id !== entry.uuid)) { latest = { error: "Claude peer prompt origin does not match its native message identity" }; continue; }
       latest = { turnId, origin: entry.origin.kind, peerMessageId: entry.origin.kind === "peer" ? entry.origin.msg_id : null };
     }
     if (!latest) throw new Error("Claude prompt transcript has no current human or peer origin");
+    if (latest.error) throw new Error(latest.error);
     return latest;
   } finally { fs.closeSync(fd); }
 }
